@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/ingestion",
+]
+
+# Shared release profile: the hot-path crates (parser, pricing, engine — added
+# in later phases) need this for realistic latency numbers. Setting it at the
+# workspace level now means Phase 3 benchmarking is comparing apples to apples
+# from day one instead of us discovering a debug-vs-release confound later.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
