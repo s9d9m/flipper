@@ -64,6 +64,9 @@ pub struct Config {
     pub tick_poll_interval_ms: u64,
     /// HTTP request timeout, in milliseconds.
     pub request_timeout_ms: u64,
+    /// Path to the SQLite database file used for auction/price history
+    /// storage (the async, off-hot-path lane — see `storage` crate).
+    pub storage_db_path: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,8 +86,8 @@ impl Config {
         let hypixel_api_key = env::var("HYPIXEL_API_KEY")
             .map_err(|_| ConfigError::MissingVar("HYPIXEL_API_KEY".into()))?;
 
-        let hypixel_base_url = env::var("HYPIXEL_BASE_URL")
-            .unwrap_or_else(|_| "https://api.hypixel.net".to_string());
+        let hypixel_base_url =
+            env::var("HYPIXEL_BASE_URL").unwrap_or_else(|_| "https://api.hypixel.net".to_string());
 
         let tick_poll_interval_ms = env::var("TICK_POLL_INTERVAL_MS")
             .unwrap_or_else(|_| "750".to_string())
@@ -106,11 +109,15 @@ impl Config {
                 )
             })?;
 
+        let storage_db_path =
+            env::var("STORAGE_DB_PATH").unwrap_or_else(|_| "auctions.sqlite3".to_string());
+
         Ok(Config {
             hypixel_api_key,
             hypixel_base_url,
             tick_poll_interval_ms,
             request_timeout_ms,
+            storage_db_path,
         })
     }
 }

@@ -1,8 +1,9 @@
 use common::{AuctionSnapshot, Config};
 use diff::DiffDetector;
 use ingestion::HypixelClient;
+use storage::SnapshotStore;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -21,10 +22,20 @@ async fn main() {
         }
     };
 
+    let storage_db_path = config.storage_db_path.clone();
+
     let client = match HypixelClient::new(config) {
         Ok(client) => client,
         Err(err) => {
             eprintln!("failed to construct hypixel client: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let store = match SnapshotStore::open(&storage_db_path) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("failed to open storage database at {storage_db_path}: {err}");
             std::process::exit(1);
         }
     };
@@ -42,23 +53,32 @@ async fn main() {
             let total = snapshot.auctions.len();
             let changed = detector.diff(snapshot);
 
+            let mut parsed = Vec::with_capacity(changed.len());
+            let mut parse_failures = 0usize;
+            for auction in &changed {
+                match parser::parse_item(auction) {
+                    Ok(item) => parsed.push(item),
+                    Err(err) => {
+                        parse_failures += 1;
+                        warn!(uuid = %auction.uuid, error = %err, "failed to parse auction item");
+                    }
+                }
+            }
+
+            let parsed_count = parsed.len();
+            if let Err(err) = store.store(tick, parsed).await {
+                warn!(tick, error = %err, "failed to persist parsed auction batch");
+            }
+
             info!(
                 tick,
                 total_auctions = total,
                 changed_auctions = changed.len(),
+                parsed_auctions = parsed_count,
+                parse_failures,
                 tracked_live = detector.tracked_count(),
-                "diffed snapshot"
+                "diffed, parsed, and stored snapshot"
             );
-
-            // Phase 1.4 (item parser) replaces this block. For now, this
-            // proves new/changed auctions flow end-to-end from the
-            // ingestion channel through diff detection.
-            for auction in changed {
-                println!(
-                    "new/changed: uuid={} item={}",
-                    auction.uuid, auction.item_name
-                );
-            }
         }
     });
 

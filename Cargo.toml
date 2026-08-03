@@ -4,6 +4,8 @@ members = [
     "crates/common",
     "crates/ingestion",
     "crates/diff",
+    "crates/parser",
+    "crates/storage",
 ]
 
 # Shared release profile: the hot-path crates (parser, pricing, engine — added

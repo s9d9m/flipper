@@ -13,6 +13,7 @@ fn test_config(base_url: String) -> Config {
         // seconds to observe a tick change.
         tick_poll_interval_ms: 10,
         request_timeout_ms: 2000,
+        storage_db_path: ":memory:".to_string(),
     }
 }
 

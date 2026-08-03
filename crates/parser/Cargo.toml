@@ -1,0 +1,12 @@
+[package]
+name = "parser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+base64 = "0.23"
+flate2 = "1"
+fastnbt = "2"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

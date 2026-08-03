@@ -110,10 +110,18 @@ hundreds of ms to seconds of pure waste versus active tick-detection.
 
 **Phase 1 — Core Backend**
 1. Rust project setup ✅ done
-2. Hypixel auction ingestion service ✅ done (see below)
+2. Hypixel auction ingestion service ✅ done (see below) — **verified
+   live against the real Hypixel API**: ~46,800 auctions/snapshot
 3. Auction diff detection ✅ done (see below)
-4. Minimal item parser — **next step, not yet built**
-5. Item fingerprinting — not built
+4. Minimal item parser ✅ done (see below)
+4.5. Auction/price storage ✅ done, added ahead of the original order
+   (see below) — the user asked for this alongside the parser under the
+   name "Phase 2: parsing and storage"; it is *not* the roadmap's
+   "Phase 2 — Website" below, which is still unbuilt. Persistence was
+   originally slated for after fingerprinting/pricing (step 6, "price
+   cache") but pulling it forward doesn't block anything else and gives
+   a place to accumulate price history immediately.
+5. Item fingerprinting — **next step, not yet built**
 6. In-memory price cache — not built
 7. Profit calculation engine — not built
 8. Flip detection — not built
@@ -124,7 +132,9 @@ profitable flip alerts.
 
 **Phase 2 — Website:** live flip feed (item name, image, buy price,
 estimated value, profit, ROI, `/viewauction` copy button), user settings
-for minimum profit/ROI. No unnecessary UI polish.
+for minimum profit/ROI. No unnecessary UI polish. (Not started — don't
+confuse with the "Phase 2: parsing and storage" naming used in session
+chat above; that work is Phase 1 steps 4 and 4.5 in this roadmap.)
 
 **Phase 3 — Optimization:** benchmark auction ingestion latency, parsing
 latency, fingerprint generation, price lookup, notification latency —
@@ -139,7 +149,8 @@ skyblock-flipper/
 │                                codegen unit) so future benchmarks are
 │                                comparing real release builds.
 ├── .env.example                 HYPIXEL_API_KEY, HYPIXEL_BASE_URL,
-│                                TICK_POLL_INTERVAL_MS, REQUEST_TIMEOUT_MS
+│                                TICK_POLL_INTERVAL_MS, REQUEST_TIMEOUT_MS,
+│                                STORAGE_DB_PATH
 ├── .gitignore
 ├── README.md                    Explains file-by-file purpose, setup,
 │                                and a toolchain gotcha (see below)
@@ -167,10 +178,15 @@ skyblock-flipper/
         │                          what's a flip.
         src/main.rs                 Standalone runnable binary. Channel
         │                          receiver runs each snapshot through
-        │                          diff::DiffDetector and prints only
-        │                          the new/changed auctions — Phase 1.4
-        │                          (parser) will replace this println!
-        │                          with real item parsing.
+        │                          diff::DiffDetector, then parser::
+        │                          parse_item on each changed auction
+        │                          (parse failures are logged and
+        │                          skipped, not fatal), then hands the
+        │                          parsed batch to storage::
+        │                          SnapshotStore::store(tick, items).
+        │                          Logs total/changed/parsed/failed
+        │                          counts and the diff detector's live-
+        │                          tracked count per snapshot.
         tests/tick_detection.rs      Integration test against a local
                                     wiremock mock server — proves
                                     tick-detection + concurrent-fetch +
@@ -195,10 +211,60 @@ skyblock-flipper/
                                    expired-auction pruning, isolating a
                                    new auction among unchanged ones,
                                    and an empty-snapshot no-op.
+    ├── parser/                    DONE: minimal item parser.
+    │   src/lib.rs                  parse_item(&RawAuction) ->
+    │                              Result<ParsedItem, ParseError>.
+    │                              Decodes item_bytes: base64 (base64
+    │                              crate) -> gzip (flate2) -> NBT
+    │                              (fastnbt). Extracts skyblock_item_id
+    │                              (ExtraAttributes.id), a color-code-
+    │                              stripped display_name, stack count,
+    │                              and the auction economics already on
+    │                              RawAuction. ExtraAttributes beyond
+    │                              `id` is kept as a raw fastnbt::Value
+    │                              (`extra_attributes` field) for the
+    │                              not-yet-built fingerprinting stage to
+    │                              interpret — deliberately not modeling
+    │                              every enchant/gem/hpb here, matching
+    │                              the two-tier lossy design in this
+    │                              file. Errors (bad base64, bad gzip,
+    │                              bad NBT, empty item list, missing
+    │                              skyblock id) are non-fatal to the
+    │                              pipeline — main.rs logs and skips.
+    │                              5 unit tests build synthetic item
+    │                              NBT with fastnbt's own nbt!/to_bytes
+    │                              and round-trip it through parse_item.
+    └── storage/                   DONE: async auction/price storage.
+        src/lib.rs                  SnapshotStore::open(db_path) opens
+                                   (creates) a SQLite file (rusqlite,
+                                   "bundled" feature — no system SQLite
+                                   needed) and spawns a dedicated OS
+                                   thread that owns the Connection.
+                                   store(tick, Vec<ParsedItem>) sends a
+                                   batch over a bounded tokio mpsc
+                                   channel and awaits a oneshot ack from
+                                   the writer thread, so callers get a
+                                   real Result without ever touching
+                                   rusqlite themselves. One row per
+                                   (uuid, tick) via INSERT OR REPLACE —
+                                   same uuid at a later tick is a new
+                                   row (price history), same uuid at the
+                                   same tick overwrites (idempotent
+                                   retries). Schema: single `auctions`
+                                   table + an index on
+                                   (skyblock_item_id, tick) for
+                                   per-item price lookups later. This
+                                   crate is the only place that knows
+                                   the backend is SQLite — swapping to
+                                   ClickHouse/Postgres later only
+                                   touches this file. 4 unit tests cover
+                                   persistence, empty-batch no-op,
+                                   same-tick overwrite, and cross-tick
+                                   history.
 ```
 
-Not yet created: `crates/parser`, `crates/pricing`, `crates/engine`,
-`crates/notify`, `crates/flipper-server`, `web/`.
+Not yet created: `crates/pricing`, `crates/engine`, `crates/notify`,
+`crates/flipper-server`, `web/`.
 
 ## Toolchain notes (read before running cargo update)
 
@@ -211,29 +277,36 @@ the ICU4X crate family, which requires edition2024 (unsupported on
 
 ## Verified working (as of last session)
 
+- **Live run against the real Hypixel API confirmed by the user**:
+  ingestion connects, ticks are detected, and full snapshots assemble
+  at ~46,800 auctions each (e.g. `tick=1785736343562 auctions=46840`).
+  The "not yet verified" caveat from earlier sessions is resolved.
 - `cargo build --workspace` — passes (debug and `--release`)
-- `cargo test --workspace` — passes (9 tests: 1 common, 6 diff, 1
-  ingestion wiremock integration, plus doc-tests), on rustc 1.94 (the
-  `url`/`idna` pin from the toolchain notes below was not needed)
-- `cargo clippy --workspace --all-targets` — clean except pre-existing
-  doc-comment lint warnings in `ingestion/src/lib.rs` (unrelated to
-  diff detection)
-- `ingestion-service` now runs every snapshot through
-  `diff::DiffDetector` before printing, so new/changed auctions are
-  isolated end-to-end from the channel through diff detection
+- `cargo test --workspace` — passes (17 tests: 1 common, 6 diff, 5
+  parser, 4 storage, 1 ingestion wiremock integration, plus doc-tests),
+  on rustc 1.94 (the `url`/`idna` pin from the toolchain notes below
+  was not needed)
+- `cargo clippy --workspace --all-targets` — clean on `parser` and
+  `storage`; pre-existing doc-comment lint warnings remain in
+  `ingestion/src/lib.rs` only (unrelated to this session's changes)
+- `ingestion-service`'s channel receiver now runs the full
+  diff → parse → store pipeline per snapshot: `diff::DiffDetector`
+  isolates new/changed auctions, `parser::parse_item` decodes each
+  one's NBT (parse failures are logged and skipped, not fatal), and
+  `storage::SnapshotStore` persists the parsed batch to SQLite. Per-
+  snapshot log line reports total/changed/parsed/failed counts plus
+  the diff detector's live-tracked count.
 - Binary starts, loads config, and fails gracefully (structured error
   log, non-zero exit, no panic) when the network is unreachable
-- Not yet verified: a live run against the real Hypixel API (the
-  environment this was built in can't reach `api.hypixel.net` — only
-  package registries were reachable). This needs to be confirmed on a
-  machine with real network access and a real `HYPIXEL_API_KEY`.
 
 ## Immediate next step
 
-**Phase 1.4: minimal item parser.** Consumes the `Vec<RawAuction>`
-`diff::DiffDetector::diff` now emits and decodes `item_bytes`
-(base64 → gzip → NBT) into just the fields that affect price (item ID
-and the handful of modifiers pricing cares about) — not full NBT
-normalization, which is deferred to the async pass per the
-fingerprinting design note above. This is the last stage before
-fingerprinting and pricing can start.
+**Phase 1.5: item fingerprinting.** Computes the hot-path lossy
+fingerprint (item ID + only the price-affecting modifiers) from the
+`extra_attributes` raw NBT `Value` that `parser::ParsedItem` already
+carries but doesn't interpret. Zero heap allocation on this path per
+the architecture decisions above. Full normalization (every gem slot,
+dye, skin) stays deferred to an async pass — `storage::ParsedItem`
+persistence already gives that async pass real data to work from.
+This fingerprint is what the in-memory price cache (step 6) will be
+keyed on.
