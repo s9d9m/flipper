@@ -9,9 +9,10 @@ use pricing::{PriceCache, PriceEntry, PriceSource, PriceTier};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::Instant;
 use storage::SnapshotStore;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Folds one BIN sighting into a per-tick "cheapest observed BIN" map,
@@ -37,6 +38,52 @@ fn accumulate_cheapest_bin<K: Eq + Hash>(
             updated_at_tick: tick,
             source: PriceSource::Live,
         });
+}
+
+/// Output/readability session: human-scale label for which pricing
+/// tier a flip's price came from, matching the task's own wording
+/// ("Exact/Major/Base"). Called once per detected flip — a rare event
+/// relative to per-auction volume — never on the per-auction hot path.
+#[inline]
+fn tier_label(tier: PriceTier) -> &'static str {
+    match tier {
+        PriceTier::Exact => "Exact",
+        PriceTier::MajorModifiers => "Major",
+        PriceTier::BaseItem => "Base",
+    }
+}
+
+/// Output/readability session: human-scale label for where a flip's
+/// price came from ("Live" this-tick observation vs "COFL" historical
+/// backfill). Same call-site guarantee as [`tier_label`] — flip-only,
+/// never per-auction.
+#[inline]
+fn price_source_label(source: PriceSource) -> &'static str {
+    match source {
+        PriceSource::Live => "Live",
+        PriceSource::Historical => "COFL",
+    }
+}
+
+/// Output/readability session: formats a coin amount with a human-scale
+/// K/M/B suffix for log readability (e.g. `923_000_000` -> `"923.0M"`)
+/// instead of a long unbroken digit string. Only ever called when
+/// building a flip alert log line — flips are rare (single digits per
+/// tick against tens of thousands of evaluated auctions), so the one
+/// small `String` allocation here adds no meaningful overhead; this
+/// function is never called from the per-auction evaluation loop.
+fn format_coins(value: i64) -> String {
+    let sign = if value < 0 { "-" } else { "" };
+    let abs = value.unsigned_abs();
+    if abs >= 1_000_000_000 {
+        format!("{sign}{:.1}B", abs as f64 / 1_000_000_000.0)
+    } else if abs >= 1_000_000 {
+        format!("{sign}{:.1}M", abs as f64 / 1_000_000.0)
+    } else if abs >= 1_000 {
+        format!("{sign}{:.1}K", abs as f64 / 1_000.0)
+    } else {
+        format!("{sign}{abs}")
+    }
 }
 
 #[tokio::main]
@@ -207,6 +254,16 @@ async fn main() {
         let mut diag_tier_base_item_hit_total: u64 = 0;
 
         while let Some(snapshot) = rx.recv().await {
+            // Output/readability session: wall-clock timer around this
+            // tick's whole processing block, purely for the "processing
+            // time" summary field below. Instant::now()/.elapsed() are
+            // monotonic-clock reads (~tens of ns, no syscall on most
+            // platforms) — the same measurement pattern
+            // ingestion::HypixelClient already uses for
+            // detect_latency_ms/snapshot_fetch_latency_ms. This measures
+            // the pipeline, it doesn't change anything about it.
+            let tick_started_at = Instant::now();
+
             let tick = snapshot.last_updated;
             let total = snapshot.auctions.len();
             let changed = detector.diff(snapshot);
@@ -270,6 +327,15 @@ async fn main() {
                             diag_max_roi_percent_ever
                                 .map_or(profit.roi_percent, |m| m.max(profit.roi_percent)),
                         );
+                        // cached_price is Copy and was only read (not
+                        // moved) by evaluate() above, so it's still
+                        // available here. Always Some at this point —
+                        // evaluate() can't reach FlipVerdict::Flip
+                        // without a priced lookup — the fallback is
+                        // defensive only, never actually exercised.
+                        let price_source = cached_price
+                            .map(|lookup| lookup.entry.source)
+                            .unwrap_or(PriceSource::Live);
                         flip_candidates.push(FlipAlert::new(
                             item.uuid.clone(),
                             item.display_name.clone(),
@@ -278,6 +344,8 @@ async fn main() {
                             profit.expected_profit,
                             profit.roi_percent,
                             item.end,
+                            tier_label(profit.tier),
+                            price_source_label(price_source),
                         ));
                     }
                     FlipVerdict::BelowThreshold(profit) => {
@@ -355,15 +423,32 @@ async fn main() {
             let flips_found = new_flips.len();
             for alert in &new_flips {
                 notification_hub.publish(alert);
+                // Output/readability session: all the same structured
+                // fields as before (unchanged names, still grep/parse-
+                // able), plus a human-readable message built from them.
+                // format_coins() allocates two small Strings here, but
+                // this arm only runs once per *deduped, new* flip —
+                // never per auction, never per tick unless a flip
+                // actually fired.
+                let buy_fmt = format_coins(alert.buy_price as i64);
+                let value_fmt = format_coins(alert.estimated_value as i64);
+                let profit_fmt = format_coins(alert.profit);
                 info!(
                     uuid = %alert.auction_uuid,
                     item = %alert.item_name,
+                    tier = alert.tier,
+                    price_source = alert.price_source,
                     buy_price = alert.buy_price,
                     estimated_value = alert.estimated_value,
                     profit = alert.profit,
                     roi_percent = alert.roi_percent,
                     viewauction = %alert.viewauction_command,
-                    "flip detected"
+                    "FLIP  {}  |  buy {buy_fmt} -> value {value_fmt}  |  profit +{profit_fmt} ({:.1}% ROI)  |  tier {} / {}  |  {}",
+                    alert.item_name,
+                    alert.roi_percent,
+                    alert.tier,
+                    alert.price_source,
+                    alert.viewauction_command,
                 );
             }
 
@@ -372,7 +457,23 @@ async fn main() {
                 warn!(tick, error = %err, "failed to persist parsed auction batch");
             }
 
-            info!(
+            // Output/readability session: elapsed is read once here,
+            // after all of this tick's processing (including the
+            // storage write above) has finished — see the comment on
+            // tick_started_at above for why this is measurement, not a
+            // pipeline change.
+            let elapsed_ms = tick_started_at.elapsed().as_secs_f64() * 1000.0;
+
+            // Full technical dump, unchanged field-for-field from
+            // before this session — still available, just moved from
+            // info! to debug! (RUST_LOG=debug to see it) so it no
+            // longer prints by default every single tick. Nothing here
+            // was recomputed differently; this is the same
+            // TEMPORARY DIAGNOSTIC INSTRUMENTATION described above the
+            // receiver task's diag_* declarations, still cumulative
+            // since process start, still pending removal once the
+            // flips_found=0 root cause is fully confirmed fixed.
+            debug!(
                 tick,
                 total_auctions = total,
                 changed_auctions = changed.len(),
@@ -385,10 +486,7 @@ async fn main() {
                 below_threshold,
                 tracked_live = detector.tracked_count(),
                 dedup_tracked = dedup.tracked_count(),
-                // TEMPORARY DIAGNOSTIC INSTRUMENTATION, cumulative since
-                // process start (see the comment above the receiver
-                // task's diag_* declarations) — remove once the
-                // flips_found=0 root cause is confirmed and fixed.
+                elapsed_ms,
                 diag_evaluated_total,
                 diag_cache_hit_total,
                 diag_historical_price_hit_total,
@@ -405,6 +503,35 @@ async fn main() {
                 diag_max_expected_profit_ever = ?diag_max_expected_profit_ever,
                 diag_max_roi_percent_ever = ?diag_max_roi_percent_ever,
                 "diffed, parsed, fingerprinted, evaluated, priced, deduped, notified, and stored snapshot"
+            );
+
+            // Output/readability session: the everyday-visible summary.
+            // Only the handful of numbers actually useful for judging
+            // "is the bot healthy" at a glance -- flips this tick, the
+            // cache-hit rate and its tier breakdown (cumulative, same
+            // counters as the debug! dump above, just distilled), how
+            // much is going unpriced, and how long this tick took to
+            // process. Cheap: two divisions and one format! call, run
+            // once per tick, not per auction.
+            let cache_hit_rate_percent = if diag_evaluated_total > 0 {
+                (diag_cache_hit_total as f64 / diag_evaluated_total as f64) * 100.0
+            } else {
+                0.0
+            };
+            info!(
+                tick,
+                flips_found,
+                cache_hit_total = diag_cache_hit_total,
+                evaluated_total = diag_evaluated_total,
+                cache_hit_rate_percent,
+                tier_exact_total = diag_tier_exact_hit_total,
+                tier_major_total = diag_tier_major_modifier_hit_total,
+                tier_base_total = diag_tier_base_item_hit_total,
+                no_price_data_total = diag_no_price_data_total,
+                elapsed_ms,
+                "tick {tick}: {flips_found} flip(s) | cache {diag_cache_hit_total}/{diag_evaluated_total} hits \
+                 ({cache_hit_rate_percent:.1}%) [exact {diag_tier_exact_hit_total} / major {diag_tier_major_modifier_hit_total} \
+                 / base {diag_tier_base_item_hit_total}] | no-price {diag_no_price_data_total} | {elapsed_ms:.1}ms"
             );
         }
     });

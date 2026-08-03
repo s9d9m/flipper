@@ -63,6 +63,17 @@ pub struct FlipAlert {
     /// Signed, matching `engine::ProfitCalculation::expected_profit`.
     pub profit: i64,
     pub roi_percent: f64,
+    /// Which pricing tier the estimate came from (`"Exact"` /
+    /// `"Major"` / `"Base"`) — output/readability session. A `&'static
+    /// str`, not a `pricing::PriceTier`, so this crate still doesn't
+    /// depend on `pricing` (same decoupling reasoning as the rest of
+    /// this module doc comment): the caller already has the tier in
+    /// scope from `engine::ProfitCalculation` and just picks the label.
+    pub tier: &'static str,
+    /// Where the price came from (`"Live"` this-tick observation or
+    /// `"COFL"` historical backfill) — output/readability session, same
+    /// `&'static str`-not-`pricing::PriceSource` reasoning as `tier`.
+    pub price_source: &'static str,
     /// The auction's own end timestamp (Hypixel `end`, unix millis).
     /// Not part of the public alert payload — used only internally by
     /// [`FlipDeduplicator`] to know when it's safe to forget this uuid,
@@ -72,6 +83,7 @@ pub struct FlipAlert {
 }
 
 impl FlipAlert {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         auction_uuid: String,
         item_name: String,
@@ -80,6 +92,8 @@ impl FlipAlert {
         profit: i64,
         roi_percent: f64,
         auction_end: i64,
+        tier: &'static str,
+        price_source: &'static str,
     ) -> Self {
         let viewauction_command = format!("/viewauction {auction_uuid}");
         Self {
@@ -90,6 +104,8 @@ impl FlipAlert {
             estimated_value,
             profit,
             roi_percent,
+            tier,
+            price_source,
             auction_end,
         }
     }
@@ -274,6 +290,8 @@ mod tests {
             980_000,
             98.0,
             end,
+            "Exact",
+            "Live",
         )
     }
 
@@ -295,6 +313,8 @@ mod tests {
         assert_eq!(value["estimated_value"], 2_000_000);
         assert_eq!(value["profit"], 980_000);
         assert_eq!(value["roi_percent"], 98.0);
+        assert_eq!(value["tier"], "Exact");
+        assert_eq!(value["price_source"], "Live");
         assert!(value.get("auction_end").is_none());
     }
 

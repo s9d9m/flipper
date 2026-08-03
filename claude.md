@@ -373,19 +373,74 @@ skyblock-flipper/
         │                          batch at once; for each surviving
         │                          (genuinely new) alert, calls
         │                          notification_hub.publish(alert)
-        │                          (non-blocking) and logs a "flip
-        │                          detected" info! line with the full
-        │                          alert payload. Then hands the parsed
+        │                          (non-blocking). Then hands the parsed
         │                          batch to storage::SnapshotStore::
-        │                          store(tick, items). Logs total/
-        │                          changed/parsed/failed/unique-
-        │                          fingerprint/priced-fingerprint
-        │                          counts, the price cache's total
-        │                          size, flips_found (now: len of the
-        │                          deduped survivors, not raw Flip
-        │                          count), below_threshold, the diff
-        │                          detector's live-tracked count, and
-        │                          dedup.tracked_count() per snapshot.
+        │                          store(tick, items).
+        │                          (output/readability session) Logging
+        │                          was restructured into three tiers,
+        │                          none of it touching the pipeline
+        │                          above — see the module's new
+        │                          format_coins/tier_label/
+        │                          price_source_label helpers, all pure
+        │                          and only ever called on an actual
+        │                          flip or once per tick, never per
+        │                          auction:
+        │                          1. Per-flip: the info! line inside
+        │                             the new_flips loop keeps every
+        │                             field it had before (uuid, item,
+        │                             buy_price, estimated_value,
+        │                             profit, roi_percent, viewauction)
+        │                             plus two new ones (tier,
+        │                             price_source), and now also
+        │                             carries a human-readable message
+        │                             built from the same data, e.g.
+        │                             "FLIP  Hyperion  |  buy 800.0M ->
+        │                             value 1.2B  |  profit +380.0M
+        │                             (47.5% ROI)  |  tier Exact / Live
+        │                             |  /viewauction abc-123". Coin
+        │                             amounts get a human-scale K/M/B
+        │                             suffix via format_coins() instead
+        │                             of a long digit string. Still
+        │                             fires only once per genuinely-new
+        │                             flip (post-dedup), same as before.
+        │                          2. Per-tick summary (info!): the
+        │                             previous single mega-line dumping
+        │                             ~20 raw fields every tick was
+        │                             split. A new, concise info! line
+        │                             carries only tick, flips_found
+        │                             (this tick), the cumulative
+        │                             cache-hit rate and its tier
+        │                             breakdown, cumulative no-price-
+        │                             data count, and elapsed_ms (new —
+        │                             wall-clock time for this tick's
+        │                             whole processing block, measured
+        │                             via std::time::Instant around the
+        │                             loop body; pure measurement, adds
+        │                             no pipeline behavior, same pattern
+        │                             ingestion::HypixelClient already
+        │                             uses for detect_latency_ms), e.g.
+        │                             "tick 1785...: 2 flip(s) | cache
+        │                             118/43585 hits (0.3%) [exact 107 /
+        │                             major 2 / base 9] | no-price
+        │                             43467 | 4.2ms".
+        │                          3. Per-tick full dump (debug!, was
+        │                             info!): every field the old mega-
+        │                             line had (total/changed/parsed/
+        │                             failed/unique-fingerprint/priced-
+        │                             fingerprint counts, price cache
+        │                             size, flips_found, below_threshold,
+        │                             tracked_live, dedup_tracked, all
+        │                             the TEMPORARY DIAGNOSTIC
+        │                             INSTRUMENTATION diag_* cumulative
+        │                             counters, now also elapsed_ms) is
+        │                             untouched field-for-field, just
+        │                             demoted from info! to debug! so it
+        │                             no longer prints by default —
+        │                             still available via RUST_LOG=debug,
+        │                             satisfying "keep machine-readable
+        │                             logs available if needed" without
+        │                             spamming the default view every
+        │                             tick.
         tests/tick_detection.rs      Integration test against a local
                                     wiremock mock server — proves
                                     tick-detection + concurrent-fetch +
@@ -785,15 +840,34 @@ skyblock-flipper/
     │                               FlipAlert { auction_uuid,
     │                               viewauction_command, item_name,
     │                               buy_price, estimated_value, profit,
-    │                               roi_percent, #[serde(skip)]
-    │                               auction_end } — the caller builds
-    │                               this from primitive ParsedItem +
-    │                               ProfitCalculation fields; this
-    │                               crate depends on neither `parser`
-    │                               nor `engine`, same decoupling
-    │                               reasoning as `engine` not depending
-    │                               on `pricing::PriceCache`. `new()`
-    │                               builds viewauction_command as
+    │                               roi_percent, tier, price_source,
+    │                               #[serde(skip)] auction_end } — the
+    │                               caller builds this from primitive
+    │                               ParsedItem + ProfitCalculation
+    │                               fields; this crate depends on
+    │                               neither `parser` nor `engine`, same
+    │                               decoupling reasoning as `engine` not
+    │                               depending on `pricing::PriceCache`.
+    │                               (output/readability session) tier
+    │                               and price_source are `&'static str`
+    │                               (`"Exact"/"Major"/"Base"`,
+    │                               `"Live"/"COFL"`), not
+    │                               `pricing::PriceTier`/`PriceSource` —
+    │                               the caller (already holding those
+    │                               enums from `engine::
+    │                               ProfitCalculation`/`pricing::
+    │                               PriceLookup`) picks the label, so
+    │                               this crate still doesn't gain a
+    │                               `pricing` dependency, preserving the
+    │                               same decoupling this module doc
+    │                               comment already argues for. Both
+    │                               fields flow straight into the
+    │                               serialized WebSocket JSON payload
+    │                               too, at no extra cost (same one
+    │                               `serde_json::to_string` call
+    │                               `NotificationHub::publish` already
+    │                               made). `new()` builds
+    │                               viewauction_command as
     │                               `format!("/viewauction {uuid}")`.
     │                               FlipDeduplicator: HashMap<uuid,
     │                               auction_end> tracking already-
@@ -1117,6 +1191,30 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   `api.hypixel.net` to observe the actual before/after effect on
   `diag_no_price_data_total` / `diag_cache_hit_total` / the per-tier
   hit counters.
+- (output/readability session) `cargo build --workspace` (debug and
+  `--release`), `cargo test --workspace` (still 98 passed / 3 ignored
+  — `notify`'s existing test suite covers the two new `FlipAlert`
+  fields, `format_coins`/`tier_label`/`price_source_label` are plain
+  pure functions not worth dedicated unit tests over), and
+  `cargo clippy --workspace --all-targets` (clean except the same
+  pre-existing `ingestion/src/lib.rs` warnings) all pass after adding
+  `tier`/`price_source` to `FlipAlert` and restructuring
+  `ingestion/main.rs`'s logging into per-flip/per-tick-summary/per-
+  tick-debug-dump (see the `notify` and `ingestion main.rs` entries
+  above). Visually verified the exact log line formatting (not just
+  that it compiles) by copying the same `format_coins`/tracing macro
+  calls into a disposable throwaway binary (built and run outside the
+  workspace, deleted after) with values matching the live numbers from
+  the price coverage session — confirmed both the per-flip line
+  ("FLIP  Hyperion  |  buy 800.0M -> value 1.2B  |  profit +380.0M
+  (47.5% ROI)  |  tier Exact / Live  |  /viewauction abc-123-def") and
+  the per-tick summary line ("tick 1785736343562: 2 flip(s) | cache
+  118/43585 hits (0.3%) [exact 107 / major 2 / base 9] | no-price
+  43467 | 4.2ms") render as designed, with the full structured
+  `key=value` fields still present after the message text. Not
+  re-verified against an actual live-running `ingestion-service`
+  process end to end — same network-access limitation as every other
+  live-run caveat in this file.
 
 ## Price coverage investigation (price coverage session)
 
