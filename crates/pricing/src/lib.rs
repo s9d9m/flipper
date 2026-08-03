@@ -191,8 +191,8 @@ fn merge_price_entry(existing: PriceEntry, incoming: PriceEntry) -> (PriceEntry,
     let incoming_weight = incoming.sample_size as u128;
     let total_weight = existing_weight + incoming_weight;
 
-    let weighted_sum =
-        existing.estimated_value as u128 * existing_weight + dampened_value as u128 * incoming_weight;
+    let weighted_sum = existing.estimated_value as u128 * existing_weight
+        + dampened_value as u128 * incoming_weight;
     // total_weight is always >= 1: both sample_size fields are always
     // >= 1 by construction (a PriceEntry is never created for zero
     // observations), so this division is never by zero.

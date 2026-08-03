@@ -17,10 +17,22 @@ use tracing_subscriber::EnvFilter;
 
 /// Folds one BIN sighting into a per-tick "cheapest observed BIN" map,
 /// keyed however the caller likes (exact fingerprint, major-modifier
-/// key, or bare item tag) — the same placeholder aggregation
-/// (`min` price, running sample count) applied at all three pricing
-/// tiers. See the loop below for why this is a placeholder, not a real
-/// fair-value estimate.
+/// key, or bare item tag) — the same `min` aggregation applied at all
+/// three pricing tiers.
+///
+/// (market-model session) This intentionally stays `min`, not an
+/// average: for a flipping bot the lowest *legitimate* BIN in a tick
+/// is the actual opportunity signal, and averaging in the tick's
+/// overpriced listings would push the estimate upward, away from what
+/// a real flip needs. This is no longer the *only* line of defense
+/// against a single lowball/mistake listing distorting the cache,
+/// though: the per-tick result built here becomes the `incoming` side
+/// of `pricing::PriceCache`'s cross-tick merge (see that crate's
+/// module doc comment), which folds it into the *existing* multi-tick
+/// average via a sample-size-weighted, outlier-dampened blend rather
+/// than letting it overwrite outright. So this function still answers
+/// "what's the best price seen this tick" (unchanged); the cache is
+/// what now remembers more than one tick's answer at a time.
 fn accumulate_cheapest_bin<K: Eq + Hash>(
     map: &mut HashMap<K, PriceEntry>,
     key: K,
@@ -252,6 +264,16 @@ async fn main() {
         let mut diag_tier_exact_hit_total: u64 = 0;
         let mut diag_tier_major_modifier_hit_total: u64 = 0;
         let mut diag_tier_base_item_hit_total: u64 = 0;
+        // market-model session: cumulative counts of what the price
+        // cache's cross-tick writes actually did — see
+        // pricing::PriceCache's update_*_batch / MergeStats. Merged =
+        // a same-source Live observation was blended into an existing
+        // estimate instead of replacing it; overwritten = a
+        // cross-source change or a fresh Historical (COFL) refresh;
+        // inserted_new = first sighting of that key ever.
+        let mut diag_live_merged_total: u64 = 0;
+        let mut diag_overwritten_total: u64 = 0;
+        let mut diag_inserted_new_total: u64 = 0;
 
         while let Some(snapshot) = rx.recv().await {
             // Output/readability session: wall-clock timer around this
@@ -411,9 +433,24 @@ async fn main() {
 
             let unique_fingerprint_count = unique_fingerprints.len();
             let priced_fingerprint_count = cheapest_bin_exact.len();
-            price_cache.update_exact_batch(cheapest_bin_exact);
-            price_cache.update_major_batch(cheapest_bin_major);
-            price_cache.update_base_batch(cheapest_bin_base);
+            // market-model session: each update_*_batch call now
+            // reports what it actually did (merged/overwrote/inserted)
+            // instead of returning (); summed into this tick's totals
+            // and folded into the cumulative diag_* counters below.
+            // Three small Copy-struct additions -- not on the hot path,
+            // this whole block already only runs once per tick.
+            let exact_merge_stats = price_cache.update_exact_batch(cheapest_bin_exact);
+            let major_merge_stats = price_cache.update_major_batch(cheapest_bin_major);
+            let base_merge_stats = price_cache.update_base_batch(cheapest_bin_base);
+            diag_live_merged_total += exact_merge_stats.live_merged
+                + major_merge_stats.live_merged
+                + base_merge_stats.live_merged;
+            diag_overwritten_total += exact_merge_stats.overwritten
+                + major_merge_stats.overwritten
+                + base_merge_stats.overwritten;
+            diag_inserted_new_total += exact_merge_stats.inserted_new
+                + major_merge_stats.inserted_new
+                + base_merge_stats.inserted_new;
 
             // Dedup (sync, in-memory, batched once per tick) then
             // publish (non-blocking) — see the notify crate's module
@@ -464,6 +501,13 @@ async fn main() {
             // pipeline change.
             let elapsed_ms = tick_started_at.elapsed().as_secs_f64() * 1000.0;
 
+            // market-model session: a full walk over every cached
+            // entry, at every tier -- same cost class as the
+            // price_cache.len() call already made every tick below,
+            // not on the hot path. Gives the average sample size and
+            // high-confidence entry count the earlier tasks asked for.
+            let cache_stats = price_cache.stats();
+
             // Full technical dump, unchanged field-for-field from
             // before this session — still available, just moved from
             // info! to debug! (RUST_LOG=debug to see it) so it no
@@ -502,6 +546,16 @@ async fn main() {
                 diag_below_threshold_total,
                 diag_max_expected_profit_ever = ?diag_max_expected_profit_ever,
                 diag_max_roi_percent_ever = ?diag_max_roi_percent_ever,
+                // market-model session: cumulative cross-tick merge
+                // outcomes (see the diag_live_merged_total declaration
+                // above) plus a snapshot of the cache's current
+                // aggregate health.
+                diag_live_merged_total,
+                diag_overwritten_total,
+                diag_inserted_new_total,
+                cache_total_entries = cache_stats.total_entries,
+                cache_average_sample_size = cache_stats.average_sample_size(),
+                cache_high_confidence_entries = cache_stats.high_confidence_entries,
                 "diffed, parsed, fingerprinted, evaluated, priced, deduped, notified, and stored snapshot"
             );
 
@@ -532,6 +586,29 @@ async fn main() {
                 "tick {tick}: {flips_found} flip(s) | cache {diag_cache_hit_total}/{diag_evaluated_total} hits \
                  ({cache_hit_rate_percent:.1}%) [exact {diag_tier_exact_hit_total} / major {diag_tier_major_modifier_hit_total} \
                  / base {diag_tier_base_item_hit_total}] | no-price {diag_no_price_data_total} | {elapsed_ms:.1}ms"
+            );
+
+            // market-model session: a second, separate concise summary
+            // for pricing-model health specifically -- distinct from
+            // the flip-detection summary above so neither line gets
+            // overloaded. Answers "is the market model actually
+            // learning over time": how many observations merged into
+            // existing estimates vs. replaced them outright, how big
+            // the average sample backing a price is, and how many
+            // entries have reached high confidence.
+            let avg_sample_size = cache_stats.average_sample_size();
+            info!(
+                cache_total_entries = cache_stats.total_entries,
+                cache_average_sample_size = avg_sample_size,
+                cache_high_confidence_entries = cache_stats.high_confidence_entries,
+                diag_live_merged_total,
+                diag_overwritten_total,
+                diag_insufficient_sample_total,
+                "pricing model: {} entries, avg sample size {avg_sample_size:.1} | {} high-confidence | \
+                 {diag_live_merged_total} live merges, {diag_overwritten_total} replaced (cumulative) | \
+                 {diag_insufficient_sample_total} flips rejected for insufficient data (cumulative)",
+                cache_stats.total_entries,
+                cache_stats.high_confidence_entries,
             );
         }
     });

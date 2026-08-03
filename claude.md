@@ -347,11 +347,8 @@ skyblock-flipper/
         │                          same tick's data would let an
         │                          auction get judged against a
         │                          "market price" derived from itself
-        │                          or its same-tick siblings. NOTE:
-        │                          "cheapest BIN this tick" remains a
-        │                          placeholder value source at every
-        │                          tier, not a real fair-value estimate;
-        │                          this entry's source is always
+        │                          or its same-tick siblings. This
+        │                          entry's source is always
         │                          PriceSource::Live (COFL-seeded
         │                          entries only ever come from the
         │                          background backfill task above and
@@ -366,8 +363,50 @@ skyblock-flipper/
         │                          a live run whether Tier 2/3 fallbacks
         │                          are actually contributing flips or
         │                          just adding rejected
-        │                          InsufficientSampleSize verdicts. Then
-        │                          runs
+        │                          InsufficientSampleSize verdicts.
+        │                          (market-model session)
+        │                          accumulate_cheapest_bin() deliberately
+        │                          still takes the *minimum* starting_bid
+        │                          seen this tick per key, not an average
+        │                          — for a flipping bot the lowest
+        │                          legitimate BIN in a tick is the actual
+        │                          opportunity signal, and averaging in a
+        │                          tick's overpriced listings would push
+        │                          the estimate upward, away from what a
+        │                          real flip needs. What changed instead
+        │                          is what happens to that per-tick
+        │                          minimum once it reaches the cache: it's
+        │                          no longer a blind overwrite (see the
+        │                          pricing entry's new "Cross-write
+        │                          merging" section) — it's now the
+        │                          incoming side of a sample-size-weighted,
+        │                          outlier-dampened merge against
+        │                          whatever's already cached, so a single
+        │                          tick's cheapest-BIN can no longer
+        │                          permanently redefine an established
+        │                          multi-tick estimate on its own. The
+        │                          three update_*_batch calls now return
+        │                          MergeStats, summed into three new
+        │                          cumulative counters
+        │                          (diag_live_merged_total,
+        │                          diag_overwritten_total,
+        │                          diag_inserted_new_total), and a new
+        │                          price_cache.stats() call once per tick
+        │                          (same cost class as the pre-existing
+        │                          price_cache.len() call) feeds
+        │                          cache_total_entries/
+        │                          cache_average_sample_size/
+        │                          cache_high_confidence_entries into both
+        │                          the debug! dump and a new dedicated
+        │                          "pricing model" info! summary line
+        │                          (separate from the flip-detection
+        │                          summary line below, so neither gets
+        │                          overloaded), e.g. "pricing model: 812
+        │                          entries, avg sample size 6.7 | 94
+        │                          high-confidence | 2310 live merges, 145
+        │                          replaced (cumulative) | 3021 flips
+        │                          rejected for insufficient data
+        │                          (cumulative)". Then runs
         │                          notify::FlipDeduplicator::filter_new
         │                          on the whole tick's flip_candidates
         │                          batch at once; for each surviving
@@ -643,6 +682,67 @@ skyblock-flipper/
     │                               see the engine entry's bug-fix note —
     │                               source: PriceSource), plus a new
     │                               confidence() -> Confidence method.
+    │                               (market-model session) update_*_batch
+    │                               no longer does a blind HashMap::insert
+    │                               on every write — see the crate's new
+    │                               "Cross-write merging" module doc
+    │                               section for the full policy, summarized:
+    │                               merge_price_entry(existing, incoming)
+    │                               is called whenever a key already has a
+    │                               cached entry. Same key + both
+    │                               PriceSource::Live -> merged via a
+    │                               sample-size-weighted running average
+    │                               (weight = sample_size, capped at
+    │                               MAX_ACCUMULATED_SAMPLE_SIZE=200 so a
+    │                               long-running entry doesn't become
+    │                               permanently unresponsive to real price
+    │                               drift), with the incoming value first
+    │                               passed through dampen_outlier() (clamps
+    │                               it to within OUTLIER_DAMPING_FACTOR=5x
+    │                               of the existing estimate before
+    │                               averaging in, so one troll/mistake
+    │                               listing moves the estimate by a bounded
+    │                               step instead of redefining it outright).
+    │                               Same key + both PriceSource::Historical,
+    │                               or a cross-source change either
+    │                               direction -> incoming replaces existing
+    │                               outright, deliberately not merged (each
+    │                               cofl::backfill cycle already recomputes
+    │                               a full-population median, and a live ask
+    │                               shouldn't be blended with a sold-price
+    │                               median). A true streaming median (store
+    │                               raw sample values, not one scalar) was
+    │                               considered and rejected: it would grow
+    │                               PriceEntry past a trivial Copy struct
+    │                               and meaningfully increase the cost of
+    │                               the ShardMap::clone(current) full-shard
+    │                               clone update_batch already does every
+    │                               write — background-lane, not hot-path,
+    │                               but not free either, and speed is
+    │                               priority #1. The read path (get/
+    │                               get_exact/get_major/get_base) is
+    │                               completely untouched by any of this —
+    │                               PriceEntry's size didn't change.
+    │                               update_exact_batch/update_major_batch/
+    │                               update_base_batch now return MergeStats
+    │                               { live_merged, overwritten,
+    │                               inserted_new } instead of () (existing
+    │                               callers that ignored the return value,
+    │                               e.g. cofl::backfill, still compile
+    │                               unchanged — Rust allows discarding a
+    │                               non-() value in statement position, and
+    │                               MergeStats is deliberately not
+    │                               #[must_use]). New PriceCache::stats()
+    │                               -> CacheStats { total_entries,
+    │                               total_sample_size,
+    │                               high_confidence_entries } walks every
+    │                               entry at every tier once — same cost
+    │                               class as the existing len() family, not
+    │                               hot-path, meant for once-per-tick
+    │                               diagnostics (see ingestion/main.rs
+    │                               below). CacheStats::average_sample_size()
+    │                               derives the mean on demand (0.0 on an
+    │                               empty cache, no divide-by-zero panic).
     │                               Confidence is a 3-value ordered enum
     │                               (Low < Medium < High) derived from
     │                               sample_size via
@@ -661,26 +761,42 @@ skyblock-flipper/
     │                               staying reachable. What estimated_value
     │                               means (median? trimmed mean?) is still
     │                               deliberately left to the caller/profit
-    │                               engine, not this crate. 16 unit tests
+    │                               engine, not this crate. 25 unit tests
     │                               (confidence thresholds/ordering, get()
     │                               falling back correctly through all
     │                               three tiers in priority order, exact
     │                               always winning when all three have
-    │                               data, per-tier overwrite semantics,
-    │                               cross-shard isolation, empty-batch
+    │                               data, cross-shard isolation, empty-batch
     │                               no-ops at every tier, concurrent
     │                               writers not losing data, reads never
-    │                               blocking a writer, and the Tier-3
-    │                               borrowed-&str-lookup property) plus two
-    │                               #[ignore]'d benchmarks (`cargo test -p
-    │                               pricing --release -- --ignored
-    │                               --nocapture`) — measured ~73 ns/op for
-    │                               a Tier-1 hit over 50,000 entries
-    │                               (essentially unchanged from the
-    │                               pre-tiering ~55 ns/op) and ~311 ns/op
-    │                               for the worst case (a miss at all three
-    │                               tiers) — both still well inside the
-    │                               <1 µs budget line below.
+    │                               blocking a writer, the Tier-3
+    │                               borrowed-&str-lookup property, plus 9
+    │                               new market-model-session tests: same-
+    │                               source-Live updates merge not overwrite
+    │                               (both the exact and base tiers), cross-
+    │                               source updates still overwrite outright,
+    │                               same-source-Historical updates still
+    │                               overwrite outright, merging weights by
+    │                               existing sample_size rather than a flat
+    │                               average, a single wildly-off observation
+    │                               gets dampened rather than dominating,
+    │                               accumulated sample_size is capped, a
+    │                               capped entry still responds to new
+    │                               data, stats() on an empty cache, and
+    │                               stats() aggregating correctly across
+    │                               all three tiers) plus two #[ignore]'d
+    │                               benchmarks (`cargo test -p pricing
+    │                               --release -- --ignored --nocapture`) —
+    │                               measured ~70-110 ns/op for a Tier-1 hit
+    │                               over 50,000 entries across different
+    │                               runs in this session (the read path
+    │                               itself is provably untouched by the
+    │                               market-model-session changes — the
+    │                               variance is this sandbox's shared CPU,
+    │                               not a code regression) and ~370-380
+    │                               ns/op for the worst case (a miss at all
+    │                               three tiers) — both still well inside
+    │                               the <1 µs budget line below.
     ├── engine/                     DONE: profit calculation engine.
     │   src/lib.rs                   evaluate(item, price: Option<
     │                               PriceLookup>, current_tick, fees:
@@ -1215,6 +1331,41 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   re-verified against an actual live-running `ingestion-service`
   process end to end — same network-access limitation as every other
   live-run caveat in this file.
+- (market-model session) `cargo fmt --all`, `cargo test --workspace`
+  (108 run + 3 `#[ignore]`'d benchmarks = 111 tests — `pricing` grew
+  from 16 to 25 unit tests, see its entry above; every other crate's
+  count unchanged), `cargo clippy --workspace --all-targets` (clean
+  except the same pre-existing `ingestion/src/lib.rs` warnings), and
+  `cargo build --release` all pass after the `PriceCache` merge/
+  dampening/stats rewrite and the `ingestion/main.rs` diagnostics
+  wiring. Confirmed via `cargo metadata --no-deps` (worth re-running
+  after any future restructuring rather than assuming): the package is
+  `ingestion`, the binary target is `ingestion-service` — that's the
+  name to use with `cargo run --bin ingestion-service` /
+  `./target/release/ingestion-service` (there is exactly one `[[bin]]`
+  in the whole workspace, so plain `cargo run --release` at the
+  workspace root also resolves to it unambiguously). Ran the actual
+  release binary (`HYPIXEL_API_KEY=test-key-not-real
+  COFL_BACKFILL_ENABLED=false ./target/release/ingestion-service`, and
+  again with `COFL_BACKFILL_ENABLED=true` and a 1-tag/1-page COFL
+  config) — both start cleanly, bind the WebSocket, log correctly, and
+  fail gracefully (structured error, non-zero exit, no panic) on the
+  expected `sandbox has no network access to api.hypixel.net`
+  restriction; same limitation as every other live-run caveat in this
+  file, so no live tick was actually processed through the new merge/
+  diagnostics code path this way. Separately visually verified the new
+  "pricing model" summary line's exact rendering (same disposable-
+  throwaway-binary technique as the output/readability session above)
+  with representative numbers: "pricing model: 812 entries, avg sample
+  size 6.7 | 94 high-confidence | 2310 live merges, 145 replaced
+  (cumulative) | 3021 flips rejected for insufficient data
+  (cumulative)". `pricing::PriceCache::get` re-benchmarked at ~70-110
+  ns/op for a Tier-1 hit across repeated runs in this session (up from
+  the tiered-pricing session's ~55-73 ns/op baseline) — the `get()`
+  code path is provably unchanged by this session's diff (verified via
+  `git diff` on the function bodies), so this is read as this sandbox's
+  shared-CPU noise, not a real regression; worth a clean re-benchmark
+  on dedicated hardware if the gap needs to be nailed down precisely.
 
 ## Price coverage investigation (price coverage session)
 
@@ -1303,6 +1454,69 @@ whether the periodic re-backfill's second cycle (after
 `*_entries_seeded` counts as COFL accumulates more sold-auction history
 over time.
 
+## Market-model session: price-accuracy audit and fix
+
+The user manually tested the sniper and found real resale prices
+didn't match displayed `estimated_value` — flips were being found, but
+valuations were sometimes wrong. Investigated via code review (no live
+Hypixel/COFL access in this sandbox to reproduce directly — confirmed
+again this session: `api.hypixel.net`/`sky.coflnet.com` both 403 at
+the proxy). Root cause, confirmed against the exact source (not
+inferred): `PriceCache::update_*_batch` did a blind `HashMap::insert`
+on every write, and `ingestion::main`'s per-tick aggregation
+(`accumulate_cheapest_bin`) builds a fresh per-key map every tick — so
+a Tier‑1 (exact fingerprint) `estimated_value` was routinely just *one
+seller's current asking price*, `sample_size` effectively reset to 1
+every tick, and Tier 1 has no confidence floor of its own to catch
+that (see `engine::evaluate`, `PriceTier::Exact => None`). A single
+mistake or lowball listing could define "market value" for whatever
+got evaluated against it next tick — a concrete, worked (not live-
+captured) example is in this session's earlier turn.
+
+Two smaller, related findings from the same audit, **not acted on this
+session** (out of scope — the user's follow-up task was specifically
+the sample-accumulation fix, not these):
+- `fingerprint::hash_gems`'s compound-shaped-gem branch (`crates/
+  fingerprint/src/lib.rs`) hashes only a gem slot's `quality`, not
+  which gem *type* occupies it — two items with different, very
+  differently-priced gems (e.g. Ruby vs. Jasper) at the same quality
+  could fingerprint identically at Tier 1. Unconfirmed whether real
+  Hypixel gem NBT is actually compound-shaped (same "not live-
+  verified" caveat this crate already carries throughout) vs. the
+  bare-string shape the code also handles correctly.
+- COFL's historical median has no time-window control (no `sort`/
+  date-range parameter is sent to `/sold?page=N`), while the entry's
+  staleness gate is anchored to the single *most recent* sale in the
+  group (`cofl::median_entries`) — a group could blend old and new
+  sales while still looking "fresh" under the 30-day ceiling.
+
+**Fixed this session** (the sample-accumulation root cause):
+`pricing::PriceCache` now merges same-key, same-`PriceSource::Live`
+writes via a sample-size-weighted running average instead of
+overwriting, with incoming values passed through a bounded outlier
+clamp first (`dampen_outlier`, max 5x move per merge) and accumulated
+`sample_size` capped (200) so old data's weight doesn't grow forever.
+Cross-source writes and same-source-Historical refreshes still replace
+outright (COFL already recomputes a full-population median per cycle;
+a live ask and a sold-price median shouldn't be blended). See the
+`pricing` crate entry above for the full design and the new
+`MergeStats`/`CacheStats` diagnostics, and the `ingestion main.rs`
+entry for how they're surfaced. Per explicit instruction, the intra-
+tick "cheapest BIN this tick" aggregation (`accumulate_cheapest_bin`)
+was deliberately **not** changed to an average — for a flipping bot
+the lowest legitimate BIN in a tick is the real opportunity signal,
+not something to dilute; the fix is entirely in what happens to that
+per-tick minimum once it reaches the cache across ticks, not in how
+it's computed within one tick.
+
+**Not yet observed against live data**: whether
+`MAX_ACCUMULATED_SAMPLE_SIZE`/`OUTLIER_DAMPING_FACTOR`'s chosen values
+(200 / 5x) behave well against real SkyBlock listing volume and
+volatility, and whether `diag_live_merged_total` /
+`cache_average_sample_size` / `cache_high_confidence_entries` actually
+show the cache building real multi-tick evidence over a live run's
+lifetime rather than staying dominated by single-observation entries.
+
 ## Flagged for a future pass (not yet acted on)
 
 The user pointed out, correctly, that the biggest speed win left on
@@ -1315,28 +1529,21 @@ Phase 1.6 since it wasn't in scope for the cache, but it's the natural
 next lever once the core pipeline (steps 7-9) is complete, or worth an
 early Phase 3-style pass if it's blocking real usage sooner.
 
-**Live-feed sample accumulation (price coverage session).** See the
-"Deliberately not done this session" note in the price coverage
-investigation above. Concretely: `PriceCache::update_*_batch` would
-need a merge policy (weighted rolling average of `estimated_value` by
-`sample_size`, summed `sample_size`, `max` of `updated_at_tick`)
-applied only when the existing cached entry and the incoming one share
-the same `PriceSource` — Live merges with Live so repeated sightings
-of the same fingerprint across many ticks actually build confidence
-instead of resetting every tick, while a fresh Live observation still
-outright replaces a stale Historical entry (not blended with it, since
-COFL's periodic re-backfill already recomputes its own full-population
-median each cycle and shouldn't be diluted by an old run's numbers
-either). Worth bounding the accumulated `sample_size` at some cap well
-above the `Confidence::High` threshold (e.g. a few hundred) so
-long-running entries don't become permanently unresponsive to genuine
-market shifts while still looking "fresh" by `updated_at_tick`. Not
-done this session because it touches `PriceCache`'s core write
-semantics, which multiple existing tests across `pricing`/`cofl`
-currently assert as a plain overwrite — a considered scope decision to
-keep this session's changes purely additive (broader COFL coverage,
-faster startup availability, periodic refresh) rather than risk a
-subtle regression in already-tested behavior other crates depend on.
+**Live-feed sample accumulation** — flagged in the price-coverage
+session, **now done** (market-model session). See the "Cross-write
+merging" section of the `pricing` crate's module doc comment and the
+`pricing`/`ingestion main.rs` entries above for the full design
+(sample-size-weighted merge, outlier dampening, capped accumulation,
+`MergeStats`/`CacheStats` diagnostics). What's still open from the
+original write-up: whether `MAX_ACCUMULATED_SAMPLE_SIZE` (200) and
+`OUTLIER_DAMPING_FACTOR` (5x) are well-calibrated for real SkyBlock
+trade volumes and price volatility — chosen by reasoning from the
+`Confidence::High` threshold and general market-shift plausibility,
+not from live data (this sandbox still has no network access to
+verify against). Worth revisiting once
+`diag_live_merged_total`/`diag_overwritten_total` and
+`cache_average_sample_size`/`cache_high_confidence_entries` (new
+diagnostics, see below) have been read off a live run.
 
 ## Known issue: flips_found=0 on live runs (partially fixed this session)
 
@@ -1530,3 +1737,16 @@ order:
    number (measured or estimated), a real profiling pass against live
    Hypixel traffic would confirm or correct the budget table above
    rather than relying on synthetic benchmarks.
+4. **(market-model session) Two smaller price-accuracy findings, not
+   yet acted on**: the `fingerprint::hash_gems` compound-shape branch
+   dropping gem *type* (only `quality` is hashed), and COFL's
+   historical median having no time-window control despite a
+   staleness gate anchored to only the newest sample in the group. See
+   "Market-model session: price-accuracy audit and fix" above for the
+   full detail — both need either explicit authorization to fix or
+   live COFL/Hypixel access to confirm the underlying assumption
+   first.
+5. **(market-model session) Calibrate `MAX_ACCUMULATED_SAMPLE_SIZE`/
+   `OUTLIER_DAMPING_FACTOR`** (200 / 5x) against real data once a live
+   run is possible — chosen by reasoning from `Confidence::High` and
+   general market-shift plausibility, not observed behavior.
