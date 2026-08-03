@@ -79,6 +79,27 @@ async fn main() {
         let mut detector = DiffDetector::new();
         let mut dedup = FlipDeduplicator::new();
 
+        // TEMPORARY DIAGNOSTIC INSTRUMENTATION — added to root-cause a
+        // live run reporting flips_found=0 / below_threshold=0 on every
+        // tick. Cumulative across the whole process lifetime (not reset
+        // per tick, unlike the other counters below) because any single
+        // tick's evaluated-auction count can be tiny once diff detection
+        // has filtered ~90% of the snapshot away, which makes per-tick
+        // numbers too noisy to diagnose from. Remove once the rejection
+        // breakdown below has been read off a live run and the root
+        // cause is fixed — this is not meant to be permanent.
+        let mut diag_evaluated_total: u64 = 0;
+        let mut diag_cache_hit_total: u64 = 0;
+        let mut diag_not_bin_total: u64 = 0;
+        let mut diag_no_price_data_total: u64 = 0;
+        let mut diag_insufficient_sample_total: u64 = 0;
+        let mut diag_stale_price_total: u64 = 0;
+        let mut diag_invalid_price_total: u64 = 0;
+        let mut diag_implausible_roi_total: u64 = 0;
+        let mut diag_below_threshold_total: u64 = 0;
+        let mut diag_max_expected_profit_ever: Option<i64> = None;
+        let mut diag_max_roi_percent_ever: Option<f64> = None;
+
         while let Some(snapshot) = rx.recv().await {
             let tick = snapshot.last_updated;
             let total = snapshot.auctions.len();
@@ -116,8 +137,22 @@ async fn main() {
                 unique_fingerprints.insert(fp);
 
                 let cached_price = price_cache.get(fp);
+
+                diag_evaluated_total += 1;
+                if cached_price.is_some() {
+                    diag_cache_hit_total += 1;
+                }
+
                 match engine::evaluate(item, cached_price, tick, &fee_schedule, &flip_thresholds) {
                     FlipVerdict::Flip(profit) => {
+                        diag_max_expected_profit_ever = Some(
+                            diag_max_expected_profit_ever
+                                .map_or(profit.expected_profit, |m| m.max(profit.expected_profit)),
+                        );
+                        diag_max_roi_percent_ever = Some(
+                            diag_max_roi_percent_ever
+                                .map_or(profit.roi_percent, |m| m.max(profit.roi_percent)),
+                        );
                         flip_candidates.push(FlipAlert::new(
                             item.uuid.clone(),
                             item.display_name.clone(),
@@ -128,8 +163,36 @@ async fn main() {
                             item.end,
                         ));
                     }
-                    FlipVerdict::BelowThreshold(_) => below_threshold += 1,
-                    _ => {}
+                    FlipVerdict::BelowThreshold(profit) => {
+                        below_threshold += 1;
+                        diag_below_threshold_total += 1;
+                        diag_max_expected_profit_ever = Some(
+                            diag_max_expected_profit_ever
+                                .map_or(profit.expected_profit, |m| m.max(profit.expected_profit)),
+                        );
+                        diag_max_roi_percent_ever = Some(
+                            diag_max_roi_percent_ever
+                                .map_or(profit.roi_percent, |m| m.max(profit.roi_percent)),
+                        );
+                    }
+                    FlipVerdict::NotBin => diag_not_bin_total += 1,
+                    FlipVerdict::NoPriceData => diag_no_price_data_total += 1,
+                    FlipVerdict::InsufficientSampleSize { .. } => {
+                        diag_insufficient_sample_total += 1
+                    }
+                    FlipVerdict::StalePrice { .. } => diag_stale_price_total += 1,
+                    FlipVerdict::InvalidPriceData => diag_invalid_price_total += 1,
+                    FlipVerdict::ImplausibleRoi { roi_percent } => {
+                        diag_implausible_roi_total += 1;
+                        // Deliberately tracked even though it's a
+                        // rejected verdict: a high implausible-ROI max
+                        // is itself a diagnostic signal that
+                        // max_plausible_roi_percent may be rejecting
+                        // genuine rare-item flips, not just bad data.
+                        diag_max_roi_percent_ever = Some(
+                            diag_max_roi_percent_ever.map_or(roi_percent, |m| m.max(roi_percent)),
+                        );
+                    }
                 }
 
                 // NOTE: `estimated_value` here is just this tick's
@@ -197,6 +260,21 @@ async fn main() {
                 below_threshold,
                 tracked_live = detector.tracked_count(),
                 dedup_tracked = dedup.tracked_count(),
+                // TEMPORARY DIAGNOSTIC INSTRUMENTATION, cumulative since
+                // process start (see the comment above the receiver
+                // task's diag_* declarations) — remove once the
+                // flips_found=0 root cause is confirmed and fixed.
+                diag_evaluated_total,
+                diag_cache_hit_total,
+                diag_not_bin_total,
+                diag_no_price_data_total,
+                diag_insufficient_sample_total,
+                diag_stale_price_total,
+                diag_invalid_price_total,
+                diag_implausible_roi_total,
+                diag_below_threshold_total,
+                diag_max_expected_profit_ever = ?diag_max_expected_profit_ever,
+                diag_max_roi_percent_ever = ?diag_max_roi_percent_ever,
                 "diffed, parsed, fingerprinted, evaluated, priced, deduped, notified, and stored snapshot"
             );
         }

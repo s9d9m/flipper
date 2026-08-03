@@ -633,21 +633,99 @@ wasn't in scope for the cache, but it's the natural next lever once
 the core pipeline (steps 7-9) is complete, or worth an early
 Phase 3-style pass if it's blocking real usage sooner.
 
+## Known issue: flips_found=0 on live runs (diagnosis in progress)
+
+A live run reported `flips_found=0` and `below_threshold=0` on every
+tick — i.e. essentially nothing reaches `engine::evaluate` far enough
+to even hit the min-profit/min-ROI check, let alone pass it. This
+confirms the "Replace the placeholder pricing feed" item flagged (but
+never acted on) since Phase 1.6 was not just a nice-to-have — it looks
+like the actual root cause of zero detections.
+
+**Root-cause hypothesis, grounded in code review (not yet confirmed
+against live data — this sandbox has no network access to
+`api.hypixel.net`):**
+
+1. `diff::DiffDetector::diff()` emits an auction **exactly once** —
+   the tick it's first listed. A BIN auction's `starting_bid`/`end`
+   never change after listing, so every later tick it's
+   `is_new_or_changed == false` and silently dropped (confirmed by the
+   crate's own `unchanged_auction_is_filtered_out_on_next_tick` test —
+   this is working exactly as designed for its original purpose).
+2. `ingestion-service`'s `cheapest_bin` feed into `price_cache` is
+   built **only** from that tick's `parsed` set — i.e. only from
+   auctions newly listed *this specific tick*.
+3. `engine::evaluate` (correctly, by the Phase 1.7 ordering
+   requirement) looks up the cache's state from **prior** ticks only,
+   never this tick's own data.
+
+Put together: a fingerprint only gets a cache hit if **two different
+auctions, from two different sellers at two different times, produce
+the exact same `Fingerprint`.** For a plain unmodified item that's
+plausible. For anything with real modifiers (reforge, stars, hot
+potato books, specific enchant levels, gems) — which is essentially
+every real listing of the exact high-value items this project cares
+about, Necron's Handle and Hyperion included, since owners virtually
+always customize those differently — two independent listings
+essentially never match exactly. `NoPriceData` should dominate, and
+because `min_sample_size`/staleness/threshold checks all happen *after*
+a cache hit, everything falls out at the very first gate. This is
+architecturally consistent with `flips_found=0` **and**
+`below_threshold=0` simultaneously.
+
+Checked and ruled out as the cause: a bug in `pricing::PriceCache`
+itself. `get()` and `update_batch()` use the identical `shard_index()`
+and `FingerprintHasher`, and the crate's own tests already prove
+insert-then-get works correctly. The mechanism is sound; it's being
+fed data that structurally can't produce hits for uniquely-modified
+items.
+
+**What was added this session (not a fix — diagnostics only, per
+explicit instruction to diagnose before changing behavior):**
+`ingestion-service`'s receiver task now tracks cumulative-since-start
+counters for every `FlipVerdict` variant
+(`diag_evaluated_total`, `diag_cache_hit_total`, `diag_not_bin_total`,
+`diag_no_price_data_total`, `diag_insufficient_sample_total`,
+`diag_stale_price_total`, `diag_invalid_price_total`,
+`diag_implausible_roi_total`, `diag_below_threshold_total`) plus
+`diag_max_expected_profit_ever` and `diag_max_roi_percent_ever`
+(tracked across `Flip`, `BelowThreshold`, *and* `ImplausibleRoi` — a
+high implausible-ROI max would itself be a signal that
+`max_plausible_roi_percent` is rejecting genuine rare-item flips, not
+just bad data). All clearly marked `// TEMPORARY DIAGNOSTIC
+INSTRUMENTATION` in `main.rs`, meant to be removed once the root cause
+is confirmed and fixed, not left in permanently. Cumulative rather
+than per-tick because diff detection can make any single tick's
+evaluated-auction count too small to read anything from.
+Zero added hot-path cost beyond a few extra integer compares/increments
+per already-evaluated auction — no new I/O, allocation, or locking.
+
+**What to look for in the next live run's logs** to confirm/refute the
+hypothesis: `diag_no_price_data_total` should dominate every other
+counter by a wide margin, `diag_cache_hit_total` should be small
+relative to `diag_evaluated_total`, and `diag_max_roi_percent_ever`
+being populated (even via the `ImplausibleRoi` path) would mean real
+opportunities are being seen but rejected, not that nothing's out
+there at all.
+
+**Not yet decided — needs the confirmed numbers first:** if this
+hypothesis holds, the real fix is a pricing-strategy change (e.g. a
+coarser fallback fingerprint tier — item id + only the modifiers that
+matter most, ignoring the long tail — used when the exact fingerprint
+misses; or seeding/backfilling the cache from `storage`'s accumulating
+history instead of only this tick's new listings), not lowering
+thresholds or removing the plausibility/sample-size guards, which the
+user was explicit about not doing blindly.
+
 ## Immediate next step
 
-**All 9 numbered Phase 1 steps are done.** There isn't a single
-obvious "next numbered step" anymore — the roadmap's Phase 1 list is
-exhausted. Realistic options, none started, no priority order implied
-by their listing here:
+**Confirm the flips_found=0 diagnosis against a live run**, using the
+new `diag_*` fields above, before deciding on a fix. Once confirmed,
+the fix belongs in the pricing strategy (see the "not yet decided"
+note above), not in the engine's guards/thresholds. Other open items,
+unblocked by this and listed in priority-neutral order:
 
-1. **Replace the placeholder pricing feed.** `main.rs`'s
-   `estimated_value` is still "cheapest BIN observed this tick,"
-   flagged as a placeholder since Phase 1.6 and never addressed. A
-   real fair-value estimate (e.g. sourced from `storage`'s
-   accumulating price history) would change which auctions even reach
-   `FlipVerdict::Flip`, so this arguably has more real-world impact on
-   flip *accuracy* than anything else left.
-2. **Ingestion latency.** Flagged since Phase 1.6, still real:
+1. **Ingestion latency.** Flagged since Phase 1.6, still real:
    `detect_latency_ms=238`, `snapshot_fetch_latency_ms=1074` from a
    live run dwarf the entire rest of the pipeline (fingerprinting is
    µs-scale, price lookup ~55 ns, evaluate ~2.9 ns). This is the
@@ -655,11 +733,11 @@ by their listing here:
    called out as the main competitive edge at the top of this file,
    and it's the one part of the stack that hasn't been touched since
    the very first session.
-3. **Phase 2 — Website**, per the Build order section above: live
+2. **Phase 2 — Website**, per the Build order section above: live
    flip feed UI, user-configurable min-profit/min-ROI settings (which
    `engine::FlipThresholds` and `pricing`'s placeholder feed are
    already structured to accept once they exist).
-4. **Phase 3 — Optimization**: now that every stage has some latency
+3. **Phase 3 — Optimization**: now that every stage has some latency
    number (measured or estimated), a real profiling pass against live
    Hypixel traffic would confirm or correct the budget table above
    rather than relying on synthetic benchmarks.
