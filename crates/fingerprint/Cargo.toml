@@ -1,0 +1,8 @@
+[package]
+name = "fingerprint"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+parser = { path = "../parser" }
+fastnbt = "2"

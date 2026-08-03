@@ -1,6 +1,7 @@
 use common::{AuctionSnapshot, Config};
 use diff::DiffDetector;
 use ingestion::HypixelClient;
+use std::collections::HashSet;
 use storage::SnapshotStore;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -65,7 +66,16 @@ async fn main() {
                 }
             }
 
+            // Fingerprinting stage: not consumed by anything yet (the RAM
+            // price cache is the next unbuilt step), but computing it here
+            // keeps the pipeline shape matching the architecture diagram
+            // and gives an early, cheap signal of how much duplicate-item
+            // collapsing the price cache will get to do once it exists.
+            let unique_fingerprints: HashSet<_> =
+                parsed.iter().map(fingerprint::fingerprint).collect();
+
             let parsed_count = parsed.len();
+            let unique_fingerprint_count = unique_fingerprints.len();
             if let Err(err) = store.store(tick, parsed).await {
                 warn!(tick, error = %err, "failed to persist parsed auction batch");
             }
@@ -76,8 +86,9 @@ async fn main() {
                 changed_auctions = changed.len(),
                 parsed_auctions = parsed_count,
                 parse_failures,
+                unique_fingerprints = unique_fingerprint_count,
                 tracked_live = detector.tracked_count(),
-                "diffed, parsed, and stored snapshot"
+                "diffed, parsed, fingerprinted, and stored snapshot"
             );
         }
     });

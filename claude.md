@@ -121,8 +121,8 @@ hundreds of ms to seconds of pure waste versus active tick-detection.
    originally slated for after fingerprinting/pricing (step 6, "price
    cache") but pulling it forward doesn't block anything else and gives
    a place to accumulate price history immediately.
-5. Item fingerprinting — **next step, not yet built**
-6. In-memory price cache — not built
+5. Item fingerprinting ✅ done (see below)
+6. In-memory price cache — **next step, not yet built**
 7. Profit calculation engine — not built
 8. Flip detection — not built
 9. WebSocket notification server — not built
@@ -181,12 +181,20 @@ skyblock-flipper/
         │                          diff::DiffDetector, then parser::
         │                          parse_item on each changed auction
         │                          (parse failures are logged and
-        │                          skipped, not fatal), then hands the
-        │                          parsed batch to storage::
+        │                          skipped, not fatal), then
+        │                          fingerprint::fingerprint on every
+        │                          parsed item (collected into a
+        │                          HashSet purely to log how many
+        │                          unique fingerprints this batch
+        │                          collapsed to — not consumed by
+        │                          anything downstream yet, since the
+        │                          price cache doesn't exist), then
+        │                          hands the parsed batch to storage::
         │                          SnapshotStore::store(tick, items).
-        │                          Logs total/changed/parsed/failed
-        │                          counts and the diff detector's live-
-        │                          tracked count per snapshot.
+        │                          Logs total/changed/parsed/failed/
+        │                          unique-fingerprint counts and the
+        │                          diff detector's live-tracked count
+        │                          per snapshot.
         tests/tick_detection.rs      Integration test against a local
                                     wiremock mock server — proves
                                     tick-detection + concurrent-fetch +
@@ -234,6 +242,60 @@ skyblock-flipper/
     │                              5 unit tests build synthetic item
     │                              NBT with fastnbt's own nbt!/to_bytes
     │                              and round-trip it through parse_item.
+    ├── fingerprint/                DONE: hot-path item fingerprinting.
+    │   src/lib.rs                   fingerprint(&ParsedItem) ->
+    │                               Fingerprint(u64). Pure/sync, no I/O,
+    │                               no async. Hashes skyblock_item_id
+    │                               plus a fixed set of ExtraAttributes
+    │                               fields known to move SkyBlock
+    │                               prices: modifier (reforge),
+    │                               rarity_upgrades (recombobulated),
+    │                               hot_potato_count, dungeon_item_level
+    │                               (stars), art_of_war_count, talisman_
+    │                               enrichment, skin, ability_scroll
+    │                               (sorted list), runes and
+    │                               enchantments (sorted compounds), and
+    │                               gems (sorted by slot, only each
+    │                               slot's quality kept). Deliberately
+    │                               ignores auction-instance fields
+    │                               (uuid/auctioneer/end/bin/
+    │                               starting_bid), ExtraAttributes.uuid/
+    │                               timestamp (random per item copy),
+    │                               display_name, and count (stack size
+    │                               affects total price, not per-unit
+    │                               identity) — see the design rationale
+    │                               in the crate's module doc comment.
+    │                               NBT tag names are sourced from
+    │                               public SkyBlock documentation, not a
+    │                               live-verified payload (no network
+    │                               access to api.hypixel.net from this
+    │                               workspace) — dungeon_item_level and
+    │                               art_of_war_count are the lower-
+    │                               confidence ones and worth checking
+    │                               against a real captured item_bytes
+    │                               once you have live access. Uses
+    │                               std::collections::hash_map::
+    │                               DefaultHasher::new() (fixed seed,
+    │                               not the randomized RandomState) so
+    │                               the fingerprint is deterministic
+    │                               across runs. Scalar fields hash by
+    │                               reference with zero allocation;
+    │                               unordered NBT compounds/lists
+    │                               (enchantments, runes, gems, ability
+    │                               scrolls) need a small bounded Vec of
+    │                               borrowed keys sorted before hashing,
+    │                               since fastnbt's Value::Compound is a
+    │                               plain HashMap with no iteration-
+    │                               order guarantee — the one deliberate
+    │                               compromise on strict zero-alloc,
+    │                               scoped to O(enchant/gem count), not
+    │                               O(full NBT tree). 11 unit tests cover
+    │                               identical items matching, auction-
+    │                               specific fields not affecting the
+    │                               hash, each modifier changing the
+    │                               hash, None-vs-empty-string not
+    │                               colliding, and hash independence
+    │                               from HashMap insertion order.
     └── storage/                   DONE: async auction/price storage.
         src/lib.rs                  SnapshotStore::open(db_path) opens
                                    (creates) a SQLite file (rusqlite,
@@ -263,8 +325,8 @@ skyblock-flipper/
                                    history.
 ```
 
-Not yet created: `crates/pricing`, `crates/engine`, `crates/notify`,
-`crates/flipper-server`, `web/`.
+Not yet created: `crates/pricing` (the in-memory price cache),
+`crates/engine`, `crates/notify`, `crates/flipper-server`, `web/`.
 
 ## Toolchain notes (read before running cargo update)
 
@@ -282,31 +344,38 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   at ~46,800 auctions each (e.g. `tick=1785736343562 auctions=46840`).
   The "not yet verified" caveat from earlier sessions is resolved.
 - `cargo build --workspace` — passes (debug and `--release`)
-- `cargo test --workspace` — passes (17 tests: 1 common, 6 diff, 5
-  parser, 4 storage, 1 ingestion wiremock integration, plus doc-tests),
-  on rustc 1.94 (the `url`/`idna` pin from the toolchain notes below
-  was not needed)
-- `cargo clippy --workspace --all-targets` — clean on `parser` and
-  `storage`; pre-existing doc-comment lint warnings remain in
-  `ingestion/src/lib.rs` only (unrelated to this session's changes)
+- `cargo test --workspace` — passes (28 tests: 1 common, 6 diff, 5
+  parser, 11 fingerprint, 4 storage, 1 ingestion wiremock integration,
+  plus doc-tests), on rustc 1.94 (the `url`/`idna` pin from the
+  toolchain notes below was not needed)
+- `cargo clippy --workspace --all-targets` — clean on `parser`,
+  `storage`, and `fingerprint`; pre-existing doc-comment lint warnings
+  remain in `ingestion/src/lib.rs` only (unrelated to this session's
+  changes)
 - `ingestion-service`'s channel receiver now runs the full
-  diff → parse → store pipeline per snapshot: `diff::DiffDetector`
-  isolates new/changed auctions, `parser::parse_item` decodes each
-  one's NBT (parse failures are logged and skipped, not fatal), and
-  `storage::SnapshotStore` persists the parsed batch to SQLite. Per-
-  snapshot log line reports total/changed/parsed/failed counts plus
-  the diff detector's live-tracked count.
+  diff → parse → fingerprint → store pipeline per snapshot:
+  `diff::DiffDetector` isolates new/changed auctions,
+  `parser::parse_item` decodes each one's NBT (parse failures are
+  logged and skipped, not fatal), `fingerprint::fingerprint` computes
+  each parsed item's price-identity key (collected into a `HashSet`
+  purely to log the unique-fingerprint count for this batch — nothing
+  consumes it yet), and `storage::SnapshotStore` persists the parsed
+  batch to SQLite. Per-snapshot log line reports total/changed/parsed/
+  failed/unique-fingerprint counts plus the diff detector's live-
+  tracked count.
 - Binary starts, loads config, and fails gracefully (structured error
   log, non-zero exit, no panic) when the network is unreachable
 
 ## Immediate next step
 
-**Phase 1.5: item fingerprinting.** Computes the hot-path lossy
-fingerprint (item ID + only the price-affecting modifiers) from the
-`extra_attributes` raw NBT `Value` that `parser::ParsedItem` already
-carries but doesn't interpret. Zero heap allocation on this path per
-the architecture decisions above. Full normalization (every gem slot,
-dye, skin) stays deferred to an async pass — `storage::ParsedItem`
-persistence already gives that async pass real data to work from.
-This fingerprint is what the in-memory price cache (step 6) will be
-keyed on.
+**Phase 1.6: in-memory price cache.** Keyed on `fingerprint::
+Fingerprint`, sharded, updated by a background task, read lock-free
+(RCU/atomic-swap style) per the architecture decisions above — the
+hot path never blocks on a cache miss, it skips and lets the
+background system price that fingerprint for next time. Feeds off the
+same parsed+fingerprinted stream `ingestion-service` already produces
+per snapshot (today that stream only goes to storage; the cache needs
+to observe it too, probably by computing a per-fingerprint running
+price estimate from `storage`'s accumulating history, or from the live
+stream directly — worth deciding which before writing code). This is
+what the profit calculation engine (step 7) will read from.
