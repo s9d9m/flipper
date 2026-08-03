@@ -231,6 +231,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "parser",
+ "pricing",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -623,6 +631,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "diff",
+ "engine",
  "fingerprint",
  "futures",
  "parser",

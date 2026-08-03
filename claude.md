@@ -123,8 +123,15 @@ hundreds of ms to seconds of pure waste versus active tick-detection.
    a place to accumulate price history immediately.
 5. Item fingerprinting ✅ done (see below)
 6. In-memory price cache ✅ done (see below)
-7. Profit calculation engine — **next step, not yet built**
-8. Flip detection — not built
+7. Profit calculation engine ✅ done (see below) — note: this step's
+   scope, per the user's explicit requirements, already includes the
+   pass/fail threshold decision ("whether it passes thresholds"), so
+   what's left of step 8 below is narrower than originally scoped:
+   deduping so the same auction isn't re-reported as a flip on every
+   tick it remains listed, plus whatever orchestration the notification
+   stage (step 9) needs.
+8. Flip detection (dedup + notification hookup) — **next step, not yet
+   built**
 9. WebSocket notification server — not built
 
 Target output of Phase 1: a user connects to the site and receives live
@@ -183,26 +190,40 @@ skyblock-flipper/
         │                          (parse failures are logged and
         │                          skipped, not fatal), then
         │                          fingerprint::fingerprint on every
-        │                          parsed item. For BIN auctions, groups
-        │                          by fingerprint and keeps the
-        │                          cheapest starting_bid observed this
-        │                          tick + a sample count, feeding that
-        │                          into a pricing::PriceCache (built
-        │                          once, held in an Arc, not yet read
-        │                          by anything else in this binary —
-        │                          the flip detector/profit calculator
-        │                          that will read it are later, unbuilt
-        │                          steps) via update_batch(). NOTE:
-        │                          "cheapest BIN this tick" is a
-        │                          placeholder value source, not a real
-        │                          fair-value estimate — that's the
-        │                          profit-calculation engine's job.
-        │                          Then hands the parsed batch to
-        │                          storage::SnapshotStore::store(tick,
-        │                          items). Logs total/changed/parsed/
-        │                          failed/unique-fingerprint/priced-
+        │                          parsed item. For each item, looks up
+        │                          pricing::PriceCache::get(fp) — the
+        │                          cache's state from *prior* ticks —
+        │                          and passes it to engine::evaluate().
+        │                          A FlipVerdict::Flip logs an info!
+        │                          "flip detected" line with the full
+        │                          profit breakdown (this is currently
+        │                          the only "notification" that
+        │                          exists — WebSocket notify is step 9,
+        │                          not yet built); BelowThreshold is
+        │                          counted; every other verdict
+        │                          (NotBin/NoPriceData/StalePrice/etc.)
+        │                          is silently skipped. Only *after*
+        │                          every item in the batch has been
+        │                          evaluated does it fold this tick's
+        │                          cheapest-BIN-per-fingerprint
+        │                          observations into the price cache
+        │                          via update_batch() — this ordering
+        │                          is load-bearing: evaluating against
+        │                          a cache already updated with this
+        │                          same tick's data would let an
+        │                          auction get judged against a
+        │                          "market price" derived from itself
+        │                          or its same-tick siblings. NOTE:
+        │                          "cheapest BIN this tick" remains a
+        │                          placeholder value source, not a
+        │                          real fair-value estimate. Then hands
+        │                          the parsed batch to storage::
+        │                          SnapshotStore::store(tick, items).
+        │                          Logs total/changed/parsed/failed/
+        │                          unique-fingerprint/priced-
         │                          fingerprint counts, the price
-        │                          cache's total size, and the diff
+        │                          cache's total size, flips_found,
+        │                          below_threshold, and the diff
         │                          detector's live-tracked count per
         │                          snapshot.
         tests/tick_detection.rs      Integration test against a local
@@ -352,6 +373,67 @@ skyblock-flipper/
     │                               50,000 entries on the machine this
     │                               was built on, well inside the <1 µs
     │                               budget line below.
+    ├── engine/                     DONE: profit calculation engine.
+    │   src/lib.rs                   evaluate(item, price: Option<
+    │                               PriceEntry>, current_tick, fees:
+    │                               &FeeSchedule, thresholds:
+    │                               &FlipThresholds) -> FlipVerdict.
+    │                               Pure/sync, no I/O, no async,
+    │                               depends only on parser (ParsedItem)
+    │                               and pricing (PriceEntry type only —
+    │                               NOT PriceCache; the caller does the
+    │                               cache lookup and passes the
+    │                               Option<PriceEntry> in, which is
+    │                               also why this crate doesn't depend
+    │                               on the fingerprint crate at all).
+    │                               Profit formula: tax =
+    │                               max(estimated_value * tax_rate,
+    │                               minimum_tax); expected_profit =
+    │                               (estimated_value - tax) -
+    │                               starting_bid, computed via i128
+    │                               intermediates so a loss can't
+    │                               overflow/underflow u64 subtraction;
+    │                               roi_percent = expected_profit /
+    │                               starting_bid * 100. FlipThresholds
+    │                               and FeeSchedule are both injected,
+    │                               not hardcoded — see the crate's
+    │                               module doc comment for the fee-
+    │                               schedule caveat (flat 1% tax, no
+    │                               verified live tax table available
+    │                               from this sandbox — same situation
+    │                               as fingerprint's NBT tag names) and
+    │                               the load-bearing ordering
+    │                               requirement on the caller (must
+    │                               look up the price *before* folding
+    │                               this tick's own observations into
+    │                               the cache — see main.rs above).
+    │                               FlipVerdict is a named-variant enum
+    │                               (Flip/BelowThreshold/NotBin/
+    │                               NoPriceData/StalePrice/
+    │                               InsufficientSampleSize/
+    │                               InvalidPriceData/ImplausibleRoi),
+    │                               not a bare bool/Option, so a caller
+    │                               can see *why* an auction wasn't
+    │                               reported. False-positive guards:
+    │                               BIN-only scope, minimum sample
+    │                               size, price staleness cutoff, a
+    │                               zero-input guard, and a max-
+    │                               plausible-ROI ceiling (an
+    │                               implausibly good "flip" is treated
+    │                               as more likely bad cache data than
+    │                               a real opportunity). 13 unit tests
+    │                               cover every FlipVerdict variant,
+    │                               overflow/panic safety at extreme
+    │                               values, and a hand-computed profit/
+    │                               tax/ROI example. One #[ignore]'d
+    │                               benchmark (`cargo test -p engine
+    │                               --release -- --ignored --nocapture`)
+    │                               measured ~2.9 ns/op for evaluate()
+    │                               — note this doesn't include the
+    │                               cache lookup itself (~55 ns,
+    │                               measured separately in pricing),
+    │                               since evaluate() takes an already-
+    │                               resolved price.
     └── storage/                   DONE: async auction/price storage.
         src/lib.rs                  SnapshotStore::open(db_path) opens
                                    (creates) a SQLite file (rusqlite,
@@ -381,8 +463,7 @@ skyblock-flipper/
                                    history.
 ```
 
-Not yet created: `crates/engine` (profit calculation + flip detection),
-`crates/notify`, `crates/flipper-server`, `web/`.
+Not yet created: `crates/notify`, `crates/flipper-server`, `web/`.
 
 ## Toolchain notes (read before running cargo update)
 
@@ -400,25 +481,35 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   at ~46,800 auctions each (e.g. `tick=1785736343562 auctions=46840`).
   The "not yet verified" caveat from earlier sessions is resolved.
 - `cargo build --workspace` — passes (debug and `--release`)
-- `cargo test --workspace` — passes (35 tests: 1 common, 6 diff, 5
-  parser, 11 fingerprint, 7 pricing (+1 `#[ignore]`'d benchmark), 4
-  storage, 1 ingestion wiremock integration, plus doc-tests), on
-  rustc 1.94 (the `url`/`idna` pin from the toolchain notes below was
-  not needed)
+- `cargo test --workspace` — passes (46 run + 2 `#[ignore]`'d
+  benchmarks = 48 tests: 1 common, 6 diff, 5 parser, 11 fingerprint, 7
+  pricing (+1 benchmark), 13 engine (+1 benchmark), 4 storage, 1
+  ingestion wiremock integration, plus doc-tests), on rustc 1.94 (the
+  `url`/`idna` pin from the toolchain notes below was not needed)
 - `cargo clippy --workspace --all-targets` — clean on `parser`,
-  `storage`, `fingerprint`, and `pricing`; pre-existing doc-comment
-  lint warnings remain in `ingestion/src/lib.rs` only (unrelated to
-  this session's changes)
+  `storage`, `fingerprint`, `pricing`, and `engine`; pre-existing
+  doc-comment lint warnings remain in `ingestion/src/lib.rs` only
+  (unrelated to this session's changes)
 - `ingestion-service`'s channel receiver now runs the full
-  diff → parse → fingerprint → price cache → store pipeline per
-  snapshot (see the `crates/ingestion/src/main.rs` entry above for the
-  exact wiring and the "cheapest BIN this tick" placeholder-pricing
+  diff → parse → fingerprint → evaluate → price cache update → store
+  pipeline per snapshot (see the `crates/ingestion/src/main.rs` entry
+  above for the exact wiring, the evaluate-before-update ordering
+  requirement, and the "cheapest BIN this tick" placeholder-pricing
   caveat). Per-snapshot log line reports total/changed/parsed/failed/
   unique-fingerprint/priced-fingerprint counts, the price cache's
-  total size, and the diff detector's live-tracked count.
+  total size, flips_found, below_threshold, and the diff detector's
+  live-tracked count. A detected flip additionally logs its own
+  "flip detected" line with the full profit breakdown.
 - `pricing::PriceCache::get` benchmarked at ~55 ns/op over 50,000
-  entries (release build, single-threaded) — see the pricing crate
-  entry above for how to reproduce.
+  entries; `engine::evaluate` benchmarked at ~2.9 ns/op (excludes the
+  cache lookup itself) — both release build, single-threaded. See the
+  respective crate entries above for how to reproduce. Note: an
+  earlier version of the engine benchmark used fixed inputs every
+  iteration and LLVM constant-folded the whole loop, reporting a
+  nonsensical "5,000,000 calls in 124ns" — fixed by varying the input
+  per iteration through `std::hint::black_box`. Worth remembering if
+  a future micro-benchmark in this workspace reports a suspiciously
+  round or tiny number.
 - Binary starts, loads config, and fails gracefully (structured error
   log, non-zero exit, no panic) when the network is unreachable
 
@@ -436,16 +527,22 @@ Phase 3-style pass if it's blocking real usage sooner.
 
 ## Immediate next step
 
-**Phase 1.7: profit calculation engine.** Reads a fingerprinted
-auction's asking price (from the parsed/fingerprinted stream
-`ingestion-service` already produces per snapshot) and looks it up in
-`pricing::PriceCache::get`. On a cache hit, computes profit/ROI
-(estimated_value minus asking price, minus AH tax); on a cache miss,
-skips fast per the "missing prices fail fast and safely" rule already
-implemented in `PriceCache::get` (returns `None`, no fallback, no
-blocking). This is also the natural point to replace `main.rs`'s
-placeholder "cheapest BIN this tick" pricing with something that
-deserves the name "profit calculation" — e.g. a real fair-value
-estimate sourced from `storage`'s accumulating price history, not just
-this tick's cheapest listing. What the engine's output feeds (flip
-detection, step 8) is not yet built either.
+**Phase 1.8: flip detection (dedup) + notification hookup.** The
+threshold pass/fail decision already lives in `engine::evaluate`
+(`FlipVerdict::Flip`), so what's left of "flip detection" as a
+distinct step is narrower than the original roadmap wording:
+1. **Dedup across ticks.** Right now `ingestion-service` logs a "flip
+   detected" line every tick an auction both remains listed *and*
+   still evaluates as a flip (an auction usually spans several ticks
+   before it's bought/expires) — there's no tracking of "have we
+   already alerted on this uuid." Needs a bounded seen-set (same shape
+   of problem `diff::DiffDetector` already solved for raw auctions,
+   possibly reusable/adjacent logic) so each auction is reported once,
+   not once per tick it survives.
+2. **Replace the placeholder pricing feed.** `main.rs`'s "cheapest BIN
+   this tick" is still not a real fair-value estimate — worth revisiting
+   once dedup exists, since a real estimate would change which auctions
+   even reach `Flip`.
+3. **WebSocket notification (step 9)** is the actual "send it
+   somewhere" step and is still fully unbuilt — right now a "flip
+   detected" log line is the only output.
