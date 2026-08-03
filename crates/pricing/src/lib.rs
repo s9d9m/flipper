@@ -60,11 +60,204 @@
 //! problem — that's the caller's (background aggregation in
 //! `ingestion`/`cofl`). This cache only stores and serves whatever
 //! value it's given, at whichever tier it's given for.
+//!
+//! # Cross-write merging (market-model session)
+//!
+//! `update_exact_batch`/`update_major_batch`/`update_base_batch` used
+//! to do a plain `HashMap::insert` — the newest write for a key always
+//! replaced whatever was cached before, no matter how well-established
+//! the old value was. Combined with `ingestion`'s per-tick aggregation
+//! (each BIN auction is only ever listed once, so a given fingerprint
+//! typically gets exactly one live sighting per relevant tick) and
+//! Tier 1 having no confidence floor of its own (see `engine`), that
+//! meant a Tier‑1 `estimated_value` was routinely just *one seller's
+//! current asking price*, trusted unconditionally — a single mistake
+//! or lowball listing could define "market value" for whatever bought
+//! against it next tick.
+//!
+//! [`merge_price_entry`] replaces the blind overwrite with a policy:
+//! - **Same key, both `PriceSource::Live`**: merged via a sample-size-
+//!   weighted running average, so `sample_size` actually reflects
+//!   accumulated evidence instead of resetting every tick. The
+//!   incoming value is first passed through [`dampen_outlier`] so one
+//!   wild listing can shift the average by only a bounded step, not
+//!   redefine it outright — see that function's doc comment.
+//! - **Same key, both `PriceSource::Historical`**: the incoming entry
+//!   replaces the existing one outright, deliberately *not* merged.
+//!   Each `cofl::backfill` cycle already recomputes a full-population
+//!   median from whatever sold-auction history it fetched; blending
+//!   two already-complete aggregates together wouldn't add
+//!   information; it would just mute genuine price movement between
+//!   backfill cycles.
+//! - **Same key, different `PriceSource`**: the incoming entry
+//!   replaces the existing one outright. A live ask and a COFL sold-
+//!   price median answer different questions — averaging them would
+//!   produce a number that accurately describes neither.
+//!
+//! None of this touches the read path: `PriceEntry` is still a
+//! fixed-size `Copy` struct (deliberately *not* a reservoir of raw
+//! samples — see `dampen_outlier`'s doc comment for why a real
+//! streaming median was considered and rejected), so `PriceCache::get`
+//! is exactly as cheap as before. All the new logic runs inside the
+//! background `update_*_batch` RCU closures, which already only ever
+//! run once per tick, never on the per-auction hot path.
 
 use arc_swap::ArcSwap;
 use fingerprint::Fingerprint;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
+
+/// Ceiling on accumulated `sample_size` for a merged (same-source-Live)
+/// entry. Four times [`Confidence::High`]'s threshold (50) — generous
+/// headroom for confidence to keep meaning something as samples build
+/// up, while still bounding two things: (a) the per-entry weight used
+/// in [`merge_price_entry`]'s running average (see that function — an
+/// uncapped weight would make old data's influence grow forever,
+/// making the cache progressively *less* responsive to genuine price
+/// drift the longer it runs), and (b) how large `sample_size` can grow
+/// without bound in a long-running process.
+const MAX_ACCUMULATED_SAMPLE_SIZE: u32 = 200;
+
+/// How far an incoming observation is allowed to move the running
+/// average in one merge, expressed as a multiple of the current
+/// estimate. An incoming value more than 5x above or below the
+/// existing estimate is clamped to that boundary before being folded
+/// in, rather than either fully trusted (letting one troll/mistake
+/// listing swing the average arbitrarily) or fully rejected (which
+/// would make the cache unable to ever track a real, large price move
+/// — a nerf or meta shift can legitimately cut a price by more than
+/// 5x). Clamping still lets the average walk toward a new true level
+/// over a few merges; it just stops one single observation from
+/// getting there in one step.
+const OUTLIER_DAMPING_FACTOR: u64 = 5;
+
+/// Clamps `incoming` to within [`OUTLIER_DAMPING_FACTOR`]x of `anchor`
+/// (the existing cached estimate) before it's folded into a weighted
+/// average. This is the crate's answer to "prevent single outliers
+/// from dominating": a bounded per-merge step instead of a true
+/// median.
+///
+/// A real streaming/windowed median was considered and rejected: it
+/// would require `PriceEntry` to carry a small reservoir of raw
+/// sample values instead of one scalar, which stops being a
+/// lock-step-cheap `Copy` struct and meaningfully increases the cost
+/// of the `ShardMap::clone(current)` full-shard clone every
+/// `update_*_batch` already does on the RCU write path. That write
+/// path is background, not hot-path, but it isn't free, and speed is
+/// priority #1 for this whole project — a clamped running average
+/// gets most of the outlier-resistance for a fraction of the cost and
+/// zero change to `PriceEntry`'s size.
+#[inline]
+fn dampen_outlier(anchor: u64, incoming: u64) -> u64 {
+    if anchor == 0 {
+        // No established estimate to compare against yet -- nothing to
+        // dampen against.
+        return incoming;
+    }
+    let lower = (anchor / OUTLIER_DAMPING_FACTOR).max(1);
+    let upper = anchor.saturating_mul(OUTLIER_DAMPING_FACTOR);
+    incoming.clamp(lower, upper)
+}
+
+/// What happened when [`merge_price_entry`] combined an incoming
+/// observation with whatever was already cached for that key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeOutcome {
+    /// Same key, same `PriceSource::Live` on both sides -- folded into
+    /// a weighted running average.
+    LiveMerged,
+    /// Existing entry was replaced outright: either a cross-source
+    /// change or a `PriceSource::Historical` refresh (see the module
+    /// doc comment for why Historical-over-Historical still replaces
+    /// rather than merges).
+    Overwritten,
+}
+
+/// Combines a newly observed `PriceEntry` with whatever's already
+/// cached for the same key. See the module doc comment for the full
+/// policy; this is the one place that policy is implemented, shared by
+/// all three tiers' write paths.
+#[inline]
+fn merge_price_entry(existing: PriceEntry, incoming: PriceEntry) -> (PriceEntry, MergeOutcome) {
+    if existing.source != incoming.source || incoming.source == PriceSource::Historical {
+        return (incoming, MergeOutcome::Overwritten);
+    }
+
+    // Both sides are PriceSource::Live: merge.
+    let dampened_value = dampen_outlier(existing.estimated_value, incoming.estimated_value);
+
+    let existing_weight = existing.sample_size.min(MAX_ACCUMULATED_SAMPLE_SIZE) as u128;
+    let incoming_weight = incoming.sample_size as u128;
+    let total_weight = existing_weight + incoming_weight;
+
+    let weighted_sum =
+        existing.estimated_value as u128 * existing_weight + dampened_value as u128 * incoming_weight;
+    // total_weight is always >= 1: both sample_size fields are always
+    // >= 1 by construction (a PriceEntry is never created for zero
+    // observations), so this division is never by zero.
+    let merged_value = (weighted_sum / total_weight) as u64;
+
+    let merged_sample_size = ((existing.sample_size as u64) + (incoming.sample_size as u64))
+        .min(MAX_ACCUMULATED_SAMPLE_SIZE as u64) as u32;
+
+    let merged = PriceEntry {
+        estimated_value: merged_value,
+        sample_size: merged_sample_size,
+        updated_at_tick: existing.updated_at_tick.max(incoming.updated_at_tick),
+        source: PriceSource::Live,
+    };
+    (merged, MergeOutcome::LiveMerged)
+}
+
+/// Counts of what a batch of `update_*_batch` writes actually did,
+/// returned so the caller can accumulate them into its own
+/// diagnostics (see `ingestion/main.rs`). Not hot-path -- computed
+/// once per background batch, alongside work that batch was already
+/// doing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergeStats {
+    /// Updates folded into an existing entry via the same-source-Live
+    /// weighted merge (see [`merge_price_entry`]).
+    pub live_merged: u64,
+    /// Updates that replaced an existing entry outright (cross-source
+    /// change, or a `PriceSource::Historical` refresh).
+    pub overwritten: u64,
+    /// Updates for a key with no prior cached entry at all.
+    pub inserted_new: u64,
+}
+
+impl std::ops::AddAssign for MergeStats {
+    fn add_assign(&mut self, other: Self) {
+        self.live_merged += other.live_merged;
+        self.overwritten += other.overwritten;
+        self.inserted_new += other.inserted_new;
+    }
+}
+
+/// Aggregate view across every entry in a [`PriceCache`], computed by
+/// walking each tier once. Not hot-path -- meant for periodic
+/// diagnostics/logging (e.g. once per tick), the same cost class as
+/// the `len()` family of methods this crate already exposes.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CacheStats {
+    pub total_entries: usize,
+    pub total_sample_size: u64,
+    /// Entries whose `confidence()` is `Confidence::High`.
+    pub high_confidence_entries: usize,
+}
+
+impl CacheStats {
+    /// Mean `sample_size` across every cached entry, at every tier.
+    /// `0.0` on an empty cache rather than a division-by-zero panic.
+    pub fn average_sample_size(&self) -> f64 {
+        if self.total_entries == 0 {
+            0.0
+        } else {
+            self.total_sample_size as f64 / self.total_entries as f64
+        }
+    }
+}
 
 /// Number of independent shards per Fingerprint-keyed tier. Power of
 /// two so shard selection is a bitmask, not a division. 64 is small
@@ -130,7 +323,7 @@ impl FingerprintShardedMap {
         shard.load().get(&fingerprint).copied()
     }
 
-    fn update_batch<I>(&self, updates: I)
+    fn update_batch<I>(&self, updates: I) -> MergeStats
     where
         I: IntoIterator<Item = (Fingerprint, PriceEntry)>,
     {
@@ -141,23 +334,65 @@ impl FingerprintShardedMap {
             by_shard[shard_index(fp)].push((fp, entry));
         }
 
+        let mut total_stats = MergeStats::default();
+
         for (idx, entries) in by_shard.into_iter().enumerate() {
             if entries.is_empty() {
                 continue;
             }
 
+            // rcu()'s closure can be re-invoked on a compare-and-swap
+            // retry, so stats can't just be accumulated inside it (a
+            // retry would double-count). Each invocation instead
+            // overwrites this Cell wholesale; once rcu() returns
+            // (meaning the *last* invocation's `next` won the CAS),
+            // the Cell holds exactly that winning invocation's counts.
+            let shard_stats = Cell::new(MergeStats::default());
+
             self.shards[idx].rcu(|current| {
                 let mut next = ShardMap::clone(current);
+                let mut stats = MergeStats::default();
                 for &(fp, entry) in &entries {
-                    next.insert(fp, entry);
+                    match next.get(&fp).copied() {
+                        Some(existing) => {
+                            let (merged, outcome) = merge_price_entry(existing, entry);
+                            next.insert(fp, merged);
+                            match outcome {
+                                MergeOutcome::LiveMerged => stats.live_merged += 1,
+                                MergeOutcome::Overwritten => stats.overwritten += 1,
+                            }
+                        }
+                        None => {
+                            next.insert(fp, entry);
+                            stats.inserted_new += 1;
+                        }
+                    }
                 }
+                shard_stats.set(stats);
                 next
             });
+
+            total_stats += shard_stats.get();
         }
+
+        total_stats
     }
 
     fn len(&self) -> usize {
         self.shards.iter().map(|s| s.load().len()).sum()
+    }
+
+    /// Folds this map's entries into `stats` -- see [`PriceCache::stats`].
+    fn fold_stats(&self, stats: &mut CacheStats) {
+        for shard in self.shards.iter() {
+            for entry in shard.load().values() {
+                stats.total_entries += 1;
+                stats.total_sample_size += entry.sample_size as u64;
+                if entry.confidence() == Confidence::High {
+                    stats.high_confidence_entries += 1;
+                }
+            }
+        }
     }
 }
 
@@ -331,42 +566,65 @@ impl PriceCache {
     }
 
     /// Applies a batch of Tier‑1 (exact fingerprint) updates. See
-    /// [`FingerprintShardedMap::update_batch`] — not on the hot path,
-    /// may allocate freely.
-    pub fn update_exact_batch<I>(&self, updates: I)
+    /// [`FingerprintShardedMap::update_batch`] and the module doc
+    /// comment's merge policy — not on the hot path, may allocate
+    /// freely. Returns counts of what actually happened (merged vs.
+    /// overwritten vs. new), for the caller's own diagnostics.
+    pub fn update_exact_batch<I>(&self, updates: I) -> MergeStats
     where
         I: IntoIterator<Item = (Fingerprint, PriceEntry)>,
     {
-        self.exact.update_batch(updates);
+        self.exact.update_batch(updates)
     }
 
     /// Applies a batch of Tier‑2 (major-modifier key) updates.
-    pub fn update_major_batch<I>(&self, updates: I)
+    pub fn update_major_batch<I>(&self, updates: I) -> MergeStats
     where
         I: IntoIterator<Item = (Fingerprint, PriceEntry)>,
     {
-        self.major.update_batch(updates);
+        self.major.update_batch(updates)
     }
 
     /// Applies a batch of Tier‑3 (base item id) updates. Unsharded — the
     /// distinct-item-id key space is small enough that a single RCU
     /// clone-on-write stays cheap without sharding.
-    pub fn update_base_batch<I>(&self, updates: I)
+    pub fn update_base_batch<I>(&self, updates: I) -> MergeStats
     where
         I: IntoIterator<Item = (String, PriceEntry)>,
     {
         let updates: Vec<(String, PriceEntry)> = updates.into_iter().collect();
         if updates.is_empty() {
-            return;
+            return MergeStats::default();
         }
+
+        // Same retry-safe capture pattern as FingerprintShardedMap::
+        // update_batch -- see that function's comment.
+        let stats_cell = Cell::new(MergeStats::default());
 
         self.base.rcu(|current| {
             let mut next = HashMap::clone(current);
+            let mut stats = MergeStats::default();
             for (item_id, entry) in &updates {
-                next.insert(item_id.clone(), *entry);
+                match next.get(item_id).copied() {
+                    Some(existing) => {
+                        let (merged, outcome) = merge_price_entry(existing, *entry);
+                        next.insert(item_id.clone(), merged);
+                        match outcome {
+                            MergeOutcome::LiveMerged => stats.live_merged += 1,
+                            MergeOutcome::Overwritten => stats.overwritten += 1,
+                        }
+                    }
+                    None => {
+                        next.insert(item_id.clone(), *entry);
+                        stats.inserted_new += 1;
+                    }
+                }
             }
+            stats_cell.set(stats);
             next
         });
+
+        stats_cell.get()
     }
 
     pub fn exact_len(&self) -> usize {
@@ -389,6 +647,23 @@ impl PriceCache {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Walks every entry, at every tier, once. Not hot-path -- meant
+    /// for periodic diagnostics (see `ingestion/main.rs`'s per-tick
+    /// pricing-model summary), the same cost class as `len()`.
+    pub fn stats(&self) -> CacheStats {
+        let mut stats = CacheStats::default();
+        self.exact.fold_stats(&mut stats);
+        self.major.fold_stats(&mut stats);
+        for entry in self.base.load().values() {
+            stats.total_entries += 1;
+            stats.total_sample_size += entry.sample_size as u64;
+            if entry.confidence() == Confidence::High {
+                stats.high_confidence_entries += 1;
+            }
+        }
+        stats
     }
 }
 
@@ -420,6 +695,15 @@ mod tests {
             sample_size,
             updated_at_tick: 1_000,
             source: PriceSource::Live,
+        }
+    }
+
+    fn historical_entry(value: u64, sample_size: u32) -> PriceEntry {
+        PriceEntry {
+            estimated_value: value,
+            sample_size,
+            updated_at_tick: 1_000,
+            source: PriceSource::Historical,
         }
     }
 
@@ -518,23 +802,139 @@ mod tests {
     }
 
     #[test]
-    fn updating_the_same_exact_fingerprint_overwrites_the_previous_value() {
+    fn updating_the_same_exact_fingerprint_with_the_same_live_source_merges_not_overwrites() {
+        // market-model session: same key, both PriceSource::Live ->
+        // weighted average, sample_size accumulates. This replaces the
+        // old blind-overwrite behavior (see
+        // cross_source_update_still_overwrites_outright and
+        // historical_refresh_still_overwrites_outright below for the
+        // cases that *do* still replace outright).
         let cache = PriceCache::new();
         cache.update_exact_batch([(Fingerprint(1), entry(1_000_000))]);
-        cache.update_exact_batch([(Fingerprint(1), entry(2_000_000))]);
+        let stats = cache.update_exact_batch([(Fingerprint(1), entry(2_000_000))]);
 
-        assert_eq!(cache.get_exact(Fingerprint(1)), Some(entry(2_000_000)));
+        // equal weight (sample_size 1 each) -> simple average.
+        assert_eq!(
+            cache.get_exact(Fingerprint(1)),
+            Some(entry_with_samples(1_500_000, 2))
+        );
         assert_eq!(cache.exact_len(), 1);
+        assert_eq!(stats.live_merged, 1);
+        assert_eq!(stats.overwritten, 0);
+        assert_eq!(stats.inserted_new, 0);
     }
 
     #[test]
-    fn updating_the_same_base_item_id_overwrites_the_previous_value() {
+    fn updating_the_same_base_item_id_with_the_same_live_source_merges_not_overwrites() {
         let cache = PriceCache::new();
         cache.update_base_batch([("HYPERION".to_string(), entry(1_000_000))]);
-        cache.update_base_batch([("HYPERION".to_string(), entry(2_000_000))]);
+        let stats = cache.update_base_batch([("HYPERION".to_string(), entry(2_000_000))]);
 
-        assert_eq!(cache.get_base("HYPERION"), Some(entry(2_000_000)));
+        assert_eq!(
+            cache.get_base("HYPERION"),
+            Some(entry_with_samples(1_500_000, 2))
+        );
         assert_eq!(cache.base_len(), 1);
+        assert_eq!(stats.live_merged, 1);
+    }
+
+    #[test]
+    fn cross_source_update_still_overwrites_outright() {
+        // A fresh Live sighting replacing a Historical entry (or vice
+        // versa) is never blended -- a live ask and a COFL sold-price
+        // median answer different questions.
+        let cache = PriceCache::new();
+        cache.update_exact_batch([(Fingerprint(1), historical_entry(1_000_000, 40))]);
+        let stats = cache.update_exact_batch([(Fingerprint(1), entry(2_000_000))]);
+
+        assert_eq!(cache.get_exact(Fingerprint(1)), Some(entry(2_000_000)));
+        assert_eq!(stats.live_merged, 0);
+        assert_eq!(stats.overwritten, 1);
+    }
+
+    #[test]
+    fn historical_refresh_still_overwrites_outright() {
+        // Same PriceSource::Historical on both sides still replaces,
+        // not merges: each cofl::backfill cycle already recomputes a
+        // full-population median, so blending two complete aggregates
+        // would just mute real price movement between cycles.
+        let cache = PriceCache::new();
+        cache.update_exact_batch([(Fingerprint(1), historical_entry(1_000_000, 40))]);
+        let stats = cache.update_exact_batch([(Fingerprint(1), historical_entry(3_000_000, 60))]);
+
+        assert_eq!(
+            cache.get_exact(Fingerprint(1)),
+            Some(historical_entry(3_000_000, 60))
+        );
+        assert_eq!(stats.live_merged, 0);
+        assert_eq!(stats.overwritten, 1);
+    }
+
+    #[test]
+    fn merge_weights_by_existing_sample_size_not_a_plain_average() {
+        // A well-established estimate (sample_size 9) should move only
+        // a little when a single new observation (sample_size 1)
+        // comes in, not jump halfway to it.
+        let cache = PriceCache::new();
+        cache.update_exact_batch([(Fingerprint(1), entry_with_samples(1_000_000, 9))]);
+        cache.update_exact_batch([(Fingerprint(1), entry_with_samples(2_000_000, 1))]);
+
+        // (1_000_000*9 + 2_000_000*1) / 10 = 1_100_000
+        let result = cache.get_exact(Fingerprint(1)).unwrap();
+        assert_eq!(result.estimated_value, 1_100_000);
+        assert_eq!(result.sample_size, 10);
+    }
+
+    #[test]
+    fn a_single_wild_observation_is_dampened_not_fully_trusted() {
+        // Incoming is 100x the established estimate -- far past the 5x
+        // damping factor -- so it should be clamped to 5x before being
+        // averaged in, not pull the estimate anywhere near the raw
+        // 100_000_000 value.
+        let cache = PriceCache::new();
+        cache.update_exact_batch([(Fingerprint(1), entry_with_samples(1_000_000, 9))]);
+        cache.update_exact_batch([(Fingerprint(1), entry_with_samples(100_000_000, 1))]);
+
+        // dampened incoming = 1_000_000 * 5 = 5_000_000.
+        // (1_000_000*9 + 5_000_000*1) / 10 = 1_400_000.
+        let result = cache.get_exact(Fingerprint(1)).unwrap();
+        assert_eq!(result.estimated_value, 1_400_000);
+        assert!(
+            result.estimated_value < 10_000_000,
+            "a single 100x outlier must not come close to dominating the average"
+        );
+    }
+
+    #[test]
+    fn accumulated_sample_size_is_capped() {
+        let cache = PriceCache::new();
+        cache.update_exact_batch([(Fingerprint(1), entry_with_samples(1_000_000, 199))]);
+        cache.update_exact_batch([(Fingerprint(1), entry_with_samples(1_000_000, 50))]);
+
+        // 199 + 50 = 249, capped to MAX_ACCUMULATED_SAMPLE_SIZE (200).
+        assert_eq!(cache.get_exact(Fingerprint(1)).unwrap().sample_size, 200);
+    }
+
+    #[test]
+    fn a_capped_entry_still_responds_to_new_observations() {
+        // Once sample_size is capped, the *reported* count stops
+        // growing, but the merge weight used internally is also capped
+        // (not the true, ever-growing historical count) -- otherwise a
+        // long-running entry would become permanently unresponsive to
+        // real price movement, since each new observation's weight
+        // would shrink toward zero forever. A single new observation
+        // should still move a capped entry by a meaningful amount.
+        let cache = PriceCache::new();
+        cache.update_exact_batch([(Fingerprint(1), entry_with_samples(1_000_000, 200))]);
+        cache.update_exact_batch([(Fingerprint(1), entry_with_samples(2_000_000, 1))]);
+
+        // (1_000_000*200 + 2_000_000*1) / 201 ≈ 1_004_975
+        let result = cache.get_exact(Fingerprint(1)).unwrap();
+        assert!(
+            result.estimated_value > 1_000_000,
+            "a capped entry must still move in response to new data, got {}",
+            result.estimated_value
+        );
     }
 
     #[test]
@@ -634,6 +1034,56 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn stats_on_empty_cache_is_all_zero_without_panicking() {
+        let cache = PriceCache::new();
+        let stats = cache.stats();
+        assert_eq!(stats.total_entries, 0);
+        assert_eq!(stats.total_sample_size, 0);
+        assert_eq!(stats.high_confidence_entries, 0);
+        assert_eq!(stats.average_sample_size(), 0.0);
+    }
+
+    #[test]
+    fn stats_aggregates_across_all_three_tiers() {
+        let cache = PriceCache::new();
+        cache.update_exact_batch([(Fingerprint(1), entry_with_samples(1_000_000, 5))]);
+        cache.update_major_batch([(Fingerprint(2), entry_with_samples(2_000_000, 15))]);
+        cache.update_base_batch([("HYPERION".to_string(), entry_with_samples(3_000_000, 50))]);
+
+        let stats = cache.stats();
+        assert_eq!(stats.total_entries, 3);
+        assert_eq!(stats.total_sample_size, 5 + 15 + 50);
+        // Only the base-tier entry (sample_size 50) reaches High.
+        assert_eq!(stats.high_confidence_entries, 1);
+        assert!((stats.average_sample_size() - (70.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_stats_distinguish_new_inserts_from_merges_and_overwrites() {
+        let cache = PriceCache::new();
+
+        let first = cache.update_exact_batch([(Fingerprint(1), entry(1_000_000))]);
+        assert_eq!(
+            first,
+            MergeStats {
+                live_merged: 0,
+                overwritten: 0,
+                inserted_new: 1,
+            }
+        );
+
+        let second = cache.update_exact_batch([(Fingerprint(1), entry(2_000_000))]);
+        assert_eq!(
+            second,
+            MergeStats {
+                live_merged: 1,
+                overwritten: 0,
+                inserted_new: 0,
+            }
+        );
     }
 }
 
