@@ -8,6 +8,27 @@
 use serde::Deserialize;
 use std::env;
 
+/// Default background-backfill item tag list (price coverage session).
+/// Two deliberately different categories, both feeding the "consistent
+/// coins/hour, occasional massive flip" goal:
+/// - endgame weapons/accessories: the rare, huge-ROI items this project
+///   also needs to catch (Hyperion, Necron's Handle, etc.) -- the
+///   original 6-tag starter list, expanded.
+/// - high-volume enchanted crafting materials: essentially no
+///   meaningful modifiers (so Tier 1 and Tier 3 collapse to nearly the
+///   same thing for them), but they dominate raw AH listing volume,
+///   so they reach Tier 1/3 confidence fast and drive the "many
+///   consistent 1-10m flips" side of the goal.
+///
+/// Sourced from general public SkyBlock community knowledge, NOT
+/// verified against a live COFL/Hypixel payload (this sandbox has no
+/// network access to either -- same caveat already documented for the
+/// `fingerprint` crate's NBT tag names). A wrong/nonexistent tag
+/// degrades gracefully: `cofl::backfill` treats a failed fetch for one
+/// tag as a logged, counted `fetch_errors` and moves on to the next
+/// tag, never panicking or blocking the rest of the crawl.
+const DEFAULT_COFL_BACKFILL_ITEM_TAGS: &str = "HYPERION,VALKYRIE,ASTRAEA,SCYLLA,NECRON_HANDLE,ASPECT_OF_THE_END,ASPECT_OF_THE_VOID,ASPECT_OF_THE_DRAGONS,LIVID_DAGGER,SHADOW_FURY,GIANTS_SWORD,MIDAS_SWORD,VOODOO_DOLL,SPIRIT_SCEPTRE,SILENT_DEATH,TERMINATOR,JUJU_SHORTBOW,RUNAANS_BOW,MOSQUITO_BOW,BONZO_STAFF,REAPER_FALCHION,PIGMAN_SWORD,ZOMBIE_SWORD,PRISMARINE_BLADE,YETI_SWORD,RAIDER_AXE,EXECUTIVE_AXE,HYPERSONIC_WAND,FLOWER_OF_TRUTH,ICE_SPRAY_WAND,TACTICIAN_SWORD,POOCH_SWORD,EMPEROR_SWORD,SPIDER_QUEEN_STINGER,HEGEMONY_ARTIFACT,WITHER_ARTIFACT,SPEED_TALISMAN,INTIMIDATION_TALISMAN,RING_OF_LOVE,HEALING_RING,POTION_AFFINITY_TALISMAN,CAMPFIRE_TALISMAN,ENCHANTED_COAL,ENCHANTED_IRON,ENCHANTED_GOLD,ENCHANTED_DIAMOND,ENCHANTED_LAPIS_LAZULI,ENCHANTED_REDSTONE,ENCHANTED_EMERALD,ENCHANTED_QUARTZ,ENCHANTED_GLOWSTONE_DUST,ENCHANTED_OBSIDIAN,ENCHANTED_ENDER_PEARL,ENCHANTED_SLIME_BALL,ENCHANTED_SUGAR_CANE,ENCHANTED_SUGAR,ENCHANTED_CACTUS_GREEN,ENCHANTED_CACTUS,ENCHANTED_MELON,ENCHANTED_MELON_BLOCK,ENCHANTED_PUMPKIN,ENCHANTED_RAW_RABBIT,ENCHANTED_RABBIT_HIDE,ENCHANTED_LEATHER,ENCHANTED_MUTTON,ENCHANTED_RAW_CHICKEN,ENCHANTED_COOKED_CHICKEN,ENCHANTED_EGG,ENCHANTED_FEATHER,ENCHANTED_RAW_BEEF,ENCHANTED_RAW_PORKCHOP,ENCHANTED_RAW_FISH,ENCHANTED_RAW_SALMON,ENCHANTED_PUFFERFISH,ENCHANTED_CLOWNFISH,ENCHANTED_PRISMARINE_SHARD,ENCHANTED_PRISMARINE_CRYSTAL,ENCHANTED_SPONGE,ENCHANTED_BONE,ENCHANTED_BONE_BLOCK,ENCHANTED_ROTTEN_FLESH,ENCHANTED_STRING,ENCHANTED_SPIDER_EYE,ENCHANTED_GUNPOWDER,ENCHANTED_NETHERRACK,ENCHANTED_NETHER_STALK,ENCHANTED_BLAZE_ROD,ENCHANTED_MAGMA_CREAM,ENCHANTED_GHAST_TEAR,ENCHANTED_ENDSTONE,ENCHANTED_COBBLESTONE,ENCHANTED_STONE,ENCHANTED_NETHER_BRICK,ENCHANTED_CLAY_BALL,ENCHANTED_CLAY_BLOCK,ENCHANTED_SNOWBALL,ENCHANTED_ICE,ENCHANTED_HAY_BLOCK,ENCHANTED_WHEAT,ENCHANTED_BREAD,ENCHANTED_CARROT,ENCHANTED_POTATO,ENCHANTED_BAKED_POTATO";
+
 /// One auction as returned by the Hypixel `/skyblock/auctions` endpoint.
 ///
 /// This only includes the fields the ingestion and parser crates actually
@@ -76,12 +97,22 @@ pub struct Config {
     pub cofl_backfill_enabled: bool,
     /// Base URL for the COFL (Coflnet, sky.coflnet.com) REST API.
     pub cofl_base_url: String,
-    /// SkyBlock item tags to backfill historical prices for at startup.
-    /// A deliberately short starter list of high-value items, not an
-    /// attempt to cover the whole catalog — see the `cofl` crate.
+    /// SkyBlock item tags to backfill historical prices for. Not an
+    /// attempt to cover the whole catalog, but broad enough (price
+    /// coverage session: ~100 items spanning endgame weapons/
+    /// accessories and high-volume enchanted materials) to move the
+    /// needle on `diag_no_price_data_total` — see the `cofl` crate and
+    /// `DEFAULT_COFL_BACKFILL_ITEM_TAGS` above.
     pub cofl_backfill_item_tags: Vec<String>,
     /// How many pages of sold-auction history to fetch per item tag.
     pub cofl_backfill_pages_per_tag: u32,
+    /// How often (minutes) to re-run the COFL backfill after the
+    /// initial startup crawl, so the price cache keeps gaining coverage
+    /// and freshness "during operation," not just once at boot (price
+    /// coverage session). `0` disables the repeat — startup-only, the
+    /// original behavior. Still entirely background: spawned, never
+    /// awaited by the ingestion hot path.
+    pub cofl_backfill_interval_minutes: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -144,9 +175,7 @@ impl Config {
             env::var("COFL_BASE_URL").unwrap_or_else(|_| "https://sky.coflnet.com/api".to_string());
 
         let cofl_backfill_item_tags = env::var("COFL_BACKFILL_ITEM_TAGS")
-            .unwrap_or_else(|_| {
-                "HYPERION,NECRON_HANDLE,ASTRAEA,SCYLLA,VALKYRIE,ASPECT_OF_THE_END".to_string()
-            })
+            .unwrap_or_else(|_| DEFAULT_COFL_BACKFILL_ITEM_TAGS.to_string())
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -162,6 +191,17 @@ impl Config {
                 )
             })?;
 
+        let cofl_backfill_interval_minutes = env::var("COFL_BACKFILL_INTERVAL_MINUTES")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse::<u64>()
+            .map_err(|_| {
+                ConfigError::InvalidVar(
+                    "COFL_BACKFILL_INTERVAL_MINUTES".into(),
+                    "expected a non-negative integer number of minutes (0 disables the repeat)"
+                        .into(),
+                )
+            })?;
+
         Ok(Config {
             hypixel_api_key,
             hypixel_base_url,
@@ -173,6 +213,7 @@ impl Config {
             cofl_base_url,
             cofl_backfill_item_tags,
             cofl_backfill_pages_per_tag,
+            cofl_backfill_interval_minutes,
         })
     }
 }

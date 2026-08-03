@@ -211,7 +211,9 @@ skyblock-flipper/
 │                                STORAGE_DB_PATH, WEBSOCKET_BIND_ADDR,
 │                                COFL_BACKFILL_ENABLED, COFL_BASE_URL,
 │                                COFL_BACKFILL_ITEM_TAGS,
-│                                COFL_BACKFILL_PAGES_PER_TAG
+│                                COFL_BACKFILL_PAGES_PER_TAG,
+│                                COFL_BACKFILL_INTERVAL_MINUTES (new,
+│                                price coverage session — see below)
 ├── .gitignore
 ├── README.md                    Explains file-by-file purpose, setup,
 │                                and a toolchain gotcha (see below)
@@ -222,7 +224,23 @@ skyblock-flipper/
     │                             AuctionSnapshot, Config, ConfigError).
     │                             No tokio/reqwest dependency — kept
     │                             minimal since every other crate
-    │                             depends on this one.
+    │                             depends on this one. (price coverage
+    │                             session) Config.cofl_backfill_item_tags'
+    │                             default grew from a 6-item hardcoded
+    │                             list to DEFAULT_COFL_BACKFILL_ITEM_TAGS,
+    │                             a ~100-item curated list (endgame
+    │                             weapons/accessories + high-volume
+    │                             enchanted materials — see the const's
+    │                             own doc comment for the full rationale
+    │                             and the same "not live-verified"
+    │                             caveat already applied to fingerprint's
+    │                             NBT tag names elsewhere in this
+    │                             project). Added a new field,
+    │                             cofl_backfill_interval_minutes (env
+    │                             COFL_BACKFILL_INTERVAL_MINUTES, default
+    │                             60, 0 disables), consumed by the new
+    │                             periodic re-backfill loop in
+    │                             ingestion/main.rs — see below.
     └── ingestion/                DONE: Hypixel polling service.
         src/lib.rs                 HypixelClient: fetch_page(),
         │                          wait_for_new_tick() (cheap repeated
@@ -253,16 +271,34 @@ skyblock-flipper/
         │                          (default true; false logs and skips
         │                          — set false in network-restricted
         │                          environments like this sandbox),
-        │                          spawns cofl::backfill(...) as its
-        │                          own background tokio task against a
-        │                          cloned Arc<PriceCache> — NOT awaited,
-        │                          so a slow/rate-limited backfill can
-        │                          never delay the ingestion loop's
-        │                          first tick; it only ever calls
+        │                          spawns a loop around cofl::backfill(...)
+        │                          as its own background tokio task
+        │                          against a cloned Arc<PriceCache> — NOT
+        │                          awaited, so a slow/rate-limited
+        │                          backfill can never delay the ingestion
+        │                          loop's first tick; it only ever calls
         │                          PriceCache::update_exact_batch/
         │                          update_major_batch/update_base_batch,
         │                          the same non-blocking write paths the
-        │                          live feed below uses.
+        │                          live feed below uses. (price coverage
+        │                          session) The single startup-only call
+        │                          became a `loop { ...; sleep(...) }`:
+        │                          runs backfill() once immediately, then
+        │                          — if config.cofl_backfill_interval_
+        │                          minutes > 0 (default 60) — sleeps that
+        │                          many minutes and runs it again,
+        │                          indefinitely, logging each cycle's
+        │                          ImportStats and the cache's running
+        │                          total size. interval_minutes == 0
+        │                          breaks after the first run (old
+        │                          startup-only behavior, still the
+        │                          default in the wiremock integration
+        │                          test's config). This finally
+        │                          implements the "seed/update... before
+        │                          and during operation" requirement from
+        │                          the original COFL task, which the
+        │                          first COFL session only half-built
+        │                          (startup-only, never repeated).
         │                          Channel receiver runs each snapshot
         │                          through diff::DiffDetector, then
         │                          parser::parse_item on each changed
@@ -912,11 +948,45 @@ skyblock-flipper/
     │                               distinct exact fingerprints but few
     │                               base item tags) without anything being
     │                               wrong. backfill() rate-limits itself
-    │                               (350ms between requests) and is
-    │                               meant to run once at startup,
+    │                               via COFL_REQUEST_DELAY and is meant to
+    │                               run at startup, optionally repeating
+    │                               periodically (see main.rs below),
     │                               concurrently with (not blocking)
-    │                               ingestion — see main.rs above. 14
-    │                               unit tests, including one proving
+    │                               ingestion. (price coverage session)
+    │                               COFL_REQUEST_DELAY raised 350ms ->
+    │                               650ms: 350ms works out to ~171
+    │                               req/min, which quietly exceeded the
+    │                               ~100 req/min limit already documented
+    │                               in this same doc comment -- a
+    │                               plausible silent contributor to
+    │                               truncated coverage (mid-crawl
+    │                               fetch_errors) even before the tag
+    │                               list was broadened. Also restructured
+    │                               to flush each item tag's three tiers
+    │                               to the cache as soon as that tag's
+    │                               pages are fetched (per-tag grouping
+    │                               maps, reset each iteration) instead
+    │                               of accumulating every tag in memory
+    │                               and writing once after the whole
+    │                               crawl -- with a ~100-item tag list
+    │                               (see the `common` crate below) a
+    │                               single end-of-crawl write would have
+    │                               delayed every price from becoming
+    │                               usable until the entire multi-minute
+    │                               crawl finished; per-tag flushing
+    │                               means the first tag's prices land in
+    │                               the cache within about one tag's
+    │                               worth of requests (a few seconds).
+    │                               ImportStats' three `*_entries_seeded`
+    │                               counters now accumulate across all
+    │                               tags (`+=` per tag) rather than being
+    │                               computed once at the end. 14 unit
+    │                               tests (same count, behavior-
+    │                               preserving refactor — end-state
+    │                               assertions unchanged since the total
+    │                               written data is the same, just
+    │                               written progressively), including
+    │                               one proving
     │                               the shortItemBytes decode path
     │                               produces byte-identical fingerprints
     │                               to a live auction, one proving the
@@ -1015,10 +1085,12 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   backfill against live data — the `notify` and `cofl` crates' own
   integration tests cover their respective paths with a real socket /
   wiremock server instead.
-- `pricing::PriceCache::get` benchmarked at ~55 ns/op over 50,000
-  entries; `engine::evaluate` benchmarked at ~2.9 ns/op (excludes the
-  cache lookup itself) — both release build, single-threaded. See the
-  respective crate entries above for how to reproduce. Note: an
+- `pricing::PriceCache::get` benchmarked at ~73 ns/op for a Tier-1 hit
+  over 50,000 entries (~311 ns/op worst case, a miss at all three
+  tiers — tiered pricing session); `engine::evaluate` benchmarked at
+  ~3.8 ns/op post-tiering (excludes the cache lookup itself) — both
+  release build, single-threaded. See the respective crate entries
+  above for how to reproduce. Note: an
   earlier version of the engine benchmark used fixed inputs every
   iteration and LLVM constant-folded the whole loop, reporting a
   nonsensical "5,000,000 calls in 124ns" — fixed by varying the input
@@ -1029,6 +1101,109 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   not custom logic worth re-benchmarking).
 - Binary starts, loads config, and fails gracefully (structured error
   log, non-zero exit, no panic) when the network is unreachable
+- (price coverage session) `cargo build --workspace` (debug and
+  `--release`), `cargo test --workspace` (still 98 passed / 3 ignored
+  benchmarks — this session's changes were background-lane
+  restructuring, not new hot-path logic, so no new tests were added;
+  existing `cofl` tests already cover the per-tag-flush refactor since
+  they assert end-state, which is unchanged), and
+  `cargo clippy --workspace --all-targets` (clean except the same
+  pre-existing `ingestion/src/lib.rs` warnings) all still pass after:
+  broadening `DEFAULT_COFL_BACKFILL_ITEM_TAGS`, adding
+  `cofl_backfill_interval_minutes`, restructuring `cofl::backfill` to
+  flush per-tag, raising `COFL_REQUEST_DELAY`, and adding the periodic
+  re-backfill loop in `ingestion/main.rs`. Not yet run live — this
+  sandbox still has no network access to `sky.coflnet.com` or
+  `api.hypixel.net` to observe the actual before/after effect on
+  `diag_no_price_data_total` / `diag_cache_hit_total` / the per-tier
+  hit counters.
+
+## Price coverage investigation (price coverage session)
+
+A live run reported `flips_found=8`, `diag_cache_hit_total=118` against
+`diag_no_price_data_total=43467` (tier breakdown: exact=107, major=2,
+base=9) — i.e. well under 1% of evaluated auctions had *any* usable
+price, at any tier. Root-caused via code review (again, no live
+COFL/Hypixel access from this sandbox to confirm the fix's actual
+effect):
+
+1. **Dominant cause: `COFL_BACKFILL_ITEM_TAGS` only covered 6 items.**
+   `cofl::backfill` is the only source of Tier 1/2/3 coverage for items
+   the live feed hasn't organically produced a repeat sighting for yet,
+   and it only ever fetches sold-auction history for the tags it's
+   told about. With 6 tags, every other item in a ~46,800-auction
+   snapshot — thousands of distinct `skyblock_item_id`s — started with
+   *zero* entries at every tier, Tier 3 (bare item id) included. This
+   is not a fingerprint-specificity problem (Tier 1 being narrow is
+   intentional, see the tiered-pricing session's design), it's a
+   coverage problem: Tier 2/3 exist to compensate for Tier 1 missing,
+   but can't help an item COFL never fetched at all.
+2. **Compounding, independently-found bug: COFL request pacing quietly
+   exceeded COFL's own documented rate limit.** `COFL_REQUEST_DELAY`
+   was 350ms between requests (~171 req/min), against a documented
+   ~100 req/min limit (already recorded in the `cofl` crate's own doc
+   comment, just never checked against the actual delay value used).
+   A plausible silent contributor to `fetch_errors` truncating
+   per-tag crawls before they finished, on top of the narrow tag list.
+3. **Secondary factor: `backfill()` only ran once, at startup**,
+   despite the original COFL task's explicit "seed/update... before
+   **and during** operation" requirement — coverage was frozen at
+   whatever the initial 6-tag crawl produced, with no mechanism to grow
+   or refresh it while the process kept running.
+
+**Fixed, all background-lane only, zero hot-path change:**
+- `DEFAULT_COFL_BACKFILL_ITEM_TAGS` (`crates/common/src/lib.rs`)
+  expanded from 6 to ~100 items (endgame weapons/accessories for the
+  "occasional massive flip" side of the goal, plus high-volume
+  enchanted crafting materials for the "many consistent 1-10m flips"
+  side, since those trade in huge numbers with essentially no
+  meaningful modifiers and so reach Tier 1/3 confidence fast). Sourced
+  from public SkyBlock community knowledge, not a live-verified
+  payload — same caveat already applied elsewhere in this project to
+  NBT tag names; a wrong/nonexistent tag degrades gracefully (counted
+  as a `fetch_errors`, never panics or blocks the rest of the crawl).
+- `COFL_REQUEST_DELAY` raised 350ms → 650ms (`crates/cofl/src/lib.rs`)
+  to actually stay under the documented ~100 req/min limit.
+- `cofl::backfill` restructured to flush each tag's three tiers to the
+  cache immediately after that tag's pages are fetched, instead of
+  accumulating the whole (now much longer) crawl in memory and writing
+  once at the end — coverage now grows progressively, with the first
+  tag's prices usable within seconds instead of waiting for the full
+  multi-minute crawl.
+- New `cofl_backfill_interval_minutes` config (default 60, `0` =
+  startup-only) drives a periodic re-run of `cofl::backfill` in
+  `ingestion/main.rs`'s already-spawned, never-awaited background task
+  — finally implementing the "during operation" half of the original
+  COFL requirement.
+
+**Deliberately not done this session** (flagged below instead): making
+the live feed's own per-tick cache writes accumulate sample size across
+ticks instead of overwriting. Right now `PriceCache::update_*_batch`
+always overwrites a key's entry with the latest batch's value —
+combined with diff detection only listing each BIN auction once, a
+given fingerprint/major-key/base-id's `sample_size` from the live feed
+alone rarely climbs past single digits before being overwritten by the
+next tick's (usually smaller) observation, capping how much Tier 1/2
+confidence can organically grow from live data independent of COFL.
+Fixing this safely (merge/rolling-average instead of overwrite) is a
+real lever, but needs a considered design for how it interacts with
+`PriceSource` (Live-over-Live should probably merge; a fresh Live
+observation replacing a stale Historical one should probably still be
+a straight overwrite, not a blend) and with the new periodic COFL
+re-backfill (each COFL run recomputes its own full-population median,
+which should probably overwrite rather than merge with a prior run) —
+see "Flagged for a future pass" below.
+
+**What to check on the next live run**, in priority order: whether
+`diag_cache_hit_total` / `diag_no_price_data_total`'s ratio improved
+materially; whether the per-tier split (exact/major/base hit counts)
+shifted now that Tier 2/3 have real coverage beyond 6 items; whether
+`cofl::ImportStats` logged at each backfill cycle shows `fetch_errors`
+staying low (confirms the rate-limit fix actually mattered); and
+whether the periodic re-backfill's second cycle (after
+`cofl_backfill_interval_minutes`, default 60 minutes) shows growing
+`*_entries_seeded` counts as COFL accumulates more sold-auction history
+over time.
 
 ## Flagged for a future pass (not yet acted on)
 
@@ -1037,10 +1212,33 @@ the table is not in this compute pipeline — it's ingestion's tick
 detection and fetch latency. Real numbers from a live run:
 `detect_latency_ms=238`, `snapshot_fetch_latency_ms=1074`. Both dwarf
 anything downstream (fingerprinting is µs-scale, price lookup is now
-measured at ~55 ns). This wasn't addressed in Phase 1.6 since it
-wasn't in scope for the cache, but it's the natural next lever once
-the core pipeline (steps 7-9) is complete, or worth an early
-Phase 3-style pass if it's blocking real usage sooner.
+measured at ~73 ns for a Tier-1 hit). This wasn't addressed in
+Phase 1.6 since it wasn't in scope for the cache, but it's the natural
+next lever once the core pipeline (steps 7-9) is complete, or worth an
+early Phase 3-style pass if it's blocking real usage sooner.
+
+**Live-feed sample accumulation (price coverage session).** See the
+"Deliberately not done this session" note in the price coverage
+investigation above. Concretely: `PriceCache::update_*_batch` would
+need a merge policy (weighted rolling average of `estimated_value` by
+`sample_size`, summed `sample_size`, `max` of `updated_at_tick`)
+applied only when the existing cached entry and the incoming one share
+the same `PriceSource` — Live merges with Live so repeated sightings
+of the same fingerprint across many ticks actually build confidence
+instead of resetting every tick, while a fresh Live observation still
+outright replaces a stale Historical entry (not blended with it, since
+COFL's periodic re-backfill already recomputes its own full-population
+median each cycle and shouldn't be diluted by an old run's numbers
+either). Worth bounding the accumulated `sample_size` at some cap well
+above the `Confidence::High` threshold (e.g. a few hundred) so
+long-running entries don't become permanently unresponsive to genuine
+market shifts while still looking "fresh" by `updated_at_tick`. Not
+done this session because it touches `PriceCache`'s core write
+semantics, which multiple existing tests across `pricing`/`cofl`
+currently assert as a plain overwrite — a considered scope decision to
+keep this session's changes purely additive (broader COFL coverage,
+faster startup availability, periodic refresh) rather than risk a
+subtle regression in already-tested behavior other crates depend on.
 
 ## Known issue: flips_found=0 on live runs (partially fixed this session)
 
@@ -1184,34 +1382,35 @@ been read off a live run.
 
 ## Immediate next step
 
-**Run it live** — this is the single highest-value next action, not
-new code. Three independent, code-confirmed fixes/mitigations
-(staleness bug fix, COFL backfill, now three-tier pricing) have landed
-across sessions for `flips_found=0` without ever having live
-Hypixel/COFL access to verify any of them end to end. A live run would
-confirm or correct, in priority order:
-1. Whether `flips_found` is now nonzero at all.
-2. Whether `cofl::ImportStats` (logged at startup) shows
-   `sales_from_real_nbt > 0` — confirms the `shortItemBytes` decode
-   assumption, the single highest-leverage unverified assumption in
-   the whole COFL integration (if it's 0, everything fell back to
-   `ReconstructedAttributes`, and the `pascal_to_snake` enchant-name
-   assumption becomes the next thing to check).
-3. Whether `diag_historical_price_hit_total` is nonzero — confirms
-   COFL-seeded prices are actually reaching `evaluate()`.
-4. Whether `diag_no_price_data_total` still dominates for the *live*
-   feed specifically (now that staleness isn't confounding the
-   reading) — confirms or refutes how much the fingerprint-sparsity
-   hypothesis still matters beyond what COFL and the new Tier 2/3
-   fallbacks cover.
-5. (New, tiered-pricing session) The split across
-   `diag_tier_exact_hit_total` / `diag_tier_major_modifier_hit_total` /
-   `diag_tier_base_item_hit_total` — confirms whether Tier 2/3 are
-   actually resolving cache hits in practice, and in what proportion
-   relative to Tier 1. If Tier 2/3 hits are common but rarely turn into
-   `Flip` verdicts, that's a signal to revisit the confidence
-   thresholds/ROI multipliers rather than assume the tiers aren't
-   helping.
+**Run it live again** — this is still the single highest-value next
+action, not new code. The first live run (which prompted the price
+coverage session above) confirmed `flips_found` is nonzero (8) — the
+staleness fix and tiered pricing are both doing *something* — but
+surfaced the coverage gap the last session's fixes fixed:
+`diag_no_price_data_total=43467` vs `diag_cache_hit_total=118`
+(exact=107, major=2, base=9). A follow-up live run, after the price
+coverage session's changes, would confirm or correct, in priority
+order:
+1. Whether `diag_cache_hit_total`'s share of total evaluated auctions
+   improved materially now that COFL covers ~100 items instead of 6 —
+   this is the headline number the whole session was aimed at.
+2. Whether the per-tier split (`diag_tier_exact_hit_total` /
+   `diag_tier_major_modifier_hit_total` / `diag_tier_base_item_hit_total`)
+   shifted — Tier 2/3 should now see meaningfully more hits than the
+   2/9 observed pre-fix, since backfill seeds all three tiers per tag
+   and there are now ~17x more tags.
+3. Whether `cofl::ImportStats`' `fetch_errors` stays low across a full
+   backfill cycle — confirms the 350ms→650ms rate-limit fix actually
+   mattered (a still-high `fetch_errors` would point at a different
+   cause, e.g. a tag in the new ~100-item list that COFL genuinely
+   doesn't recognize).
+4. Whether `cofl::ImportStats.sales_from_real_nbt > 0` — still the
+   single highest-leverage unverified assumption in the whole COFL
+   integration (unrelated to this session's changes, still open from
+   the original COFL session).
+5. Whether `flips_found` itself grew, and by how much — the actual
+   coins/hour-relevant outcome, not just the intermediate cache-hit
+   metric.
 
 Other open items, unblocked by this and listed in priority-neutral
 order:

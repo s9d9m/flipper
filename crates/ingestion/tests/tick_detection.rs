@@ -19,6 +19,7 @@ fn test_config(base_url: String) -> Config {
         cofl_base_url: "http://127.0.0.1:0".to_string(),
         cofl_backfill_item_tags: Vec::new(),
         cofl_backfill_pages_per_tag: 0,
+        cofl_backfill_interval_minutes: 0,
     }
 }
 

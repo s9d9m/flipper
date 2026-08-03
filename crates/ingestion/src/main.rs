@@ -61,6 +61,7 @@ async fn main() {
     let cofl_base_url = config.cofl_base_url.clone();
     let cofl_backfill_item_tags = config.cofl_backfill_item_tags.clone();
     let cofl_backfill_pages_per_tag = config.cofl_backfill_pages_per_tag;
+    let cofl_backfill_interval_minutes = config.cofl_backfill_interval_minutes;
 
     let client = match HypixelClient::new(config) {
         Ok(client) => client,
@@ -94,15 +95,23 @@ async fn main() {
 
     let price_cache = Arc::new(PriceCache::new());
 
-    // COFL historical-price backfill: runs once, entirely in the
-    // background, concurrently with ingestion startup below (not
-    // awaited, so a slow/rate-limited backfill can never delay the
-    // sniper path's first tick). It only ever calls
+    // COFL historical-price backfill: entirely in the background,
+    // concurrently with ingestion startup below (not awaited, so a
+    // slow/rate-limited backfill can never delay the sniper path's
+    // first tick). It only ever calls
     // PriceCache::update_{exact,major,base}_batch, the same non-blocking
     // write paths the live feed uses further down — the hot path
     // (PriceCache::get, engine::evaluate) has no idea whether an entry
     // came from here or a live tick. See the cofl crate for the
     // investigation behind this and its confirmed-vs-assumed caveats.
+    //
+    // (price coverage session) Runs once immediately, then — if
+    // cofl_backfill_interval_minutes > 0 — repeats on that interval for
+    // as long as the process runs, so coverage keeps growing/refreshing
+    // "during operation" instead of being frozen at whatever the
+    // startup crawl produced. Still just a loop of the same
+    // already-non-blocking cofl::backfill call; nothing here is awaited
+    // by (or can delay) the ingestion loop below.
     if cofl_backfill_enabled {
         let backfill_cache = Arc::clone(&price_cache);
         tokio::spawn(async move {
@@ -113,13 +122,36 @@ async fn main() {
                     return;
                 }
             };
-            cofl::backfill(
-                &client,
-                &cofl_backfill_item_tags,
-                cofl_backfill_pages_per_tag,
-                &backfill_cache,
-            )
-            .await;
+            loop {
+                let stats = cofl::backfill(
+                    &client,
+                    &cofl_backfill_item_tags,
+                    cofl_backfill_pages_per_tag,
+                    &backfill_cache,
+                )
+                .await;
+
+                if cofl_backfill_interval_minutes == 0 {
+                    info!(
+                        cache_entries = backfill_cache.len(),
+                        "COFL backfill complete (one-shot, COFL_BACKFILL_INTERVAL_MINUTES=0)"
+                    );
+                    break;
+                }
+
+                info!(
+                    exact_entries_seeded = stats.exact_entries_seeded,
+                    major_modifier_entries_seeded = stats.major_modifier_entries_seeded,
+                    base_item_entries_seeded = stats.base_item_entries_seeded,
+                    cache_entries = backfill_cache.len(),
+                    next_run_in_minutes = cofl_backfill_interval_minutes,
+                    "COFL backfill cycle complete; sleeping until next scheduled run"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    cofl_backfill_interval_minutes * 60,
+                ))
+                .await;
+            }
         });
     } else {
         info!("COFL historical backfill disabled (COFL_BACKFILL_ENABLED=false)");

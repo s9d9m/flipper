@@ -483,13 +483,34 @@ pub struct ImportStats {
     pub sales_from_reconstruction: u64,
 }
 
+/// Minimum delay between successive COFL requests. COFL's documented
+/// public rate limit is ~30 req/10s and ~100 req/min (see the module
+/// doc comment); 100/min works out to one request every 600ms, so
+/// 650ms leaves a small safety margin instead of pacing right on the
+/// edge of the limit. An earlier version of this crate used 350ms
+/// (~171 req/min), which quietly exceeded the documented 100/min limit
+/// — a plausible source of mid-crawl `fetch_errors` truncating coverage
+/// even before the item-tag list was broadened (price coverage
+/// session).
+const COFL_REQUEST_DELAY: Duration = Duration::from_millis(650);
+
 /// Backfills `cache` with historical prices for `item_tags`, up to
-/// `pages_per_tag` pages of sold-auction history each. Meant to run once
-/// at startup, concurrently with (not blocking) ingestion — see
-/// `ingestion-service`'s `main.rs`. Rate-limits itself to stay
-/// comfortably under COFL's public rate limits (documented ~30 req/10s,
-/// 100 req/min); irrelevant to hot-path latency since this never runs
-/// anywhere near the detection loop.
+/// `pages_per_tag` pages of sold-auction history each. Meant to run at
+/// startup (and optionally repeat periodically — see
+/// `ingestion-service`'s `main.rs`), concurrently with (not blocking)
+/// ingestion. Rate-limits itself via [`COFL_REQUEST_DELAY`] to stay
+/// under COFL's public rate limits; irrelevant to hot-path latency
+/// since this never runs anywhere near the detection loop.
+///
+/// Flushes each item tag's aggregated tiers to `cache` as soon as that
+/// tag's pages are fetched, rather than accumulating every tag in
+/// memory and writing once at the end (price coverage session) — with
+/// a broad tag list, a single end-of-crawl write would delay every
+/// price from becoming usable until the entire (multi-minute) crawl
+/// finished. Per-tag flushing means the first tag's prices are live in
+/// the cache within about one tag's worth of requests (a few seconds),
+/// and coverage grows continuously while the rest of the crawl runs in
+/// the background.
 pub async fn backfill(
     client: &CoflClient,
     item_tags: &[String],
@@ -497,20 +518,21 @@ pub async fn backfill(
     cache: &PriceCache,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
-    let mut exact_grouped: HashMap<Fingerprint, Vec<u64>> = HashMap::new();
-    let mut exact_latest: HashMap<Fingerprint, i64> = HashMap::new();
-    let mut major_grouped: HashMap<Fingerprint, Vec<u64>> = HashMap::new();
-    let mut major_latest: HashMap<Fingerprint, i64> = HashMap::new();
-    let mut base_grouped: HashMap<String, Vec<u64>> = HashMap::new();
-    let mut base_latest: HashMap<String, i64> = HashMap::new();
     let mut first_request = true;
 
     for tag in item_tags {
         stats.item_tags_attempted += 1;
 
+        let mut exact_grouped: HashMap<Fingerprint, Vec<u64>> = HashMap::new();
+        let mut exact_latest: HashMap<Fingerprint, i64> = HashMap::new();
+        let mut major_grouped: HashMap<Fingerprint, Vec<u64>> = HashMap::new();
+        let mut major_latest: HashMap<Fingerprint, i64> = HashMap::new();
+        let mut base_grouped: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut base_latest: HashMap<String, i64> = HashMap::new();
+
         for page in 0..pages_per_tag {
             if !first_request {
-                tokio::time::sleep(Duration::from_millis(350)).await;
+                tokio::time::sleep(COFL_REQUEST_DELAY).await;
             }
             first_request = false;
 
@@ -561,21 +583,21 @@ pub async fn backfill(
                 }
             }
         }
+
+        stats.fingerprints_loaded += exact_grouped.len() as u64;
+
+        let exact_updates = median_entries(exact_grouped, &exact_latest);
+        let major_updates = median_entries(major_grouped, &major_latest);
+        let base_updates = median_entries(base_grouped, &base_latest);
+
+        stats.exact_entries_seeded += exact_updates.len() as u64;
+        stats.major_modifier_entries_seeded += major_updates.len() as u64;
+        stats.base_item_entries_seeded += base_updates.len() as u64;
+
+        cache.update_exact_batch(exact_updates);
+        cache.update_major_batch(major_updates);
+        cache.update_base_batch(base_updates);
     }
-
-    stats.fingerprints_loaded = exact_grouped.len() as u64;
-
-    let exact_updates = median_entries(exact_grouped, &exact_latest);
-    let major_updates = median_entries(major_grouped, &major_latest);
-    let base_updates = median_entries(base_grouped, &base_latest);
-
-    stats.exact_entries_seeded = exact_updates.len() as u64;
-    stats.major_modifier_entries_seeded = major_updates.len() as u64;
-    stats.base_item_entries_seeded = base_updates.len() as u64;
-
-    cache.update_exact_batch(exact_updates);
-    cache.update_major_batch(major_updates);
-    cache.update_base_batch(base_updates);
 
     info!(
         item_tags_attempted = stats.item_tags_attempted,
