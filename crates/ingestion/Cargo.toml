@@ -11,6 +11,7 @@ fingerprint = { path = "../fingerprint" }
 pricing = { path = "../pricing" }
 engine = { path = "../engine" }
 notify = { path = "../notify" }
+cofl = { path = "../cofl" }
 storage = { path = "../storage" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }

@@ -44,7 +44,17 @@ competitive edge comes from:
   path.** These were deliberately removed from the original "analytics
   platform" design when the goal was reframed to pure latency. ClickHouse
   (historical sales), PostgreSQL (user config), and Redis (secondary
-  cache) all exist only in the async/background lane.
+  cache) all exist only in the async/background lane. In practice the
+  historical-sales role is filled by SQLite (`storage` crate, own auction
+  observations) and COFL (`cofl` crate, third-party historical sold-
+  auction data used to seed the price cache at startup) rather than
+  ClickHouse — see those crates' entries below for why.
+- **`PriceEntry` carries a `source: Live | Historical`.** A live-fed
+  price (this tick's own cheapest-BIN observation) and a COFL-backfilled
+  historical price are different kinds of signal with different
+  freshness expectations, and `engine::FlipThresholds` applies a
+  different staleness ceiling to each (minutes vs. 30 days) — see the
+  `pricing`/`engine`/`cofl` entries below.
 - **Messaging: NATS**, not Kafka — chosen for latency and operational
   simplicity, not durability (flips are worthless seconds after Hypixel's
   next tick). NATS only sits between "matched flip" and "fan-out to many
@@ -139,11 +149,24 @@ hundreds of ms to seconds of pure waste versus active tick-detection.
 **All 9 numbered Phase 1 steps are now built.** Target output of
 Phase 1 ("a user connects to the site and receives live profitable
 flip alerts") is technically achievable today for any WebSocket
-client, though there's no *site* yet — that's Phase 2. What's left
-that isn't a numbered step:
-- The pricing feed is still `main.rs`'s placeholder "cheapest BIN
-  this tick," not a real fair-value estimate (noted since Phase 1.6,
-  never addressed — see the ingestion/main.rs entry below).
+client, though there's no *site* yet — that's Phase 2.
+
+10. COFL historical pricing backend ✅ done, added beyond the original
+    9-step list (see the `cofl` crate entry below) — partially
+    addresses the "placeholder pricing feed" gap noted below by seeding
+    `PriceCache` with real historical sold-auction data at startup, so
+    the bot has price knowledge before any live auction has taught it
+    anything. Still leaves the *live* feed's "cheapest BIN this tick"
+    as a placeholder — COFL only ever writes `PriceSource::Historical`
+    entries, which a live-fed `PriceSource::Live` entry for the same
+    fingerprint will still overwrite once observed.
+
+What's left that isn't a numbered step:
+- The *live* pricing feed is still `main.rs`'s placeholder "cheapest
+  BIN this tick," not a real fair-value estimate (noted since
+  Phase 1.6, never addressed — see the ingestion/main.rs entry below).
+  COFL backfill (step 10) softens this for the startup/cold-start case
+  but doesn't replace it.
 - The ingestion tick-detection/fetch latency flagged below
   (`detect_latency_ms=238`, `snapshot_fetch_latency_ms=1074`) still
   dwarfs the rest of the compute pipeline and hasn't been touched.
@@ -170,7 +193,10 @@ skyblock-flipper/
 │                                comparing real release builds.
 ├── .env.example                 HYPIXEL_API_KEY, HYPIXEL_BASE_URL,
 │                                TICK_POLL_INTERVAL_MS, REQUEST_TIMEOUT_MS,
-│                                STORAGE_DB_PATH, WEBSOCKET_BIND_ADDR
+│                                STORAGE_DB_PATH, WEBSOCKET_BIND_ADDR,
+│                                COFL_BACKFILL_ENABLED, COFL_BASE_URL,
+│                                COFL_BACKFILL_ITEM_TAGS,
+│                                COFL_BACKFILL_PAGES_PER_TAG
 ├── .gitignore
 ├── README.md                    Explains file-by-file purpose, setup,
 │                                and a toolchain gotcha (see below)
@@ -207,7 +233,20 @@ skyblock-flipper/
         │                          spawns NotificationHub::serve(...)
         │                          as its own background task before
         │                          the ingestion channel receiver task
-        │                          is even spawned.
+        │                          is even spawned. Then, if
+        │                          config.cofl_backfill_enabled
+        │                          (default true; false logs and skips
+        │                          — set false in network-restricted
+        │                          environments like this sandbox),
+        │                          spawns cofl::backfill(...) as its
+        │                          own background tokio task against a
+        │                          cloned Arc<PriceCache> — NOT awaited,
+        │                          so a slow/rate-limited backfill can
+        │                          never delay the ingestion loop's
+        │                          first tick; it only ever calls
+        │                          PriceCache::update_batch, the same
+        │                          non-blocking write path the live
+        │                          feed below uses.
         │                          Channel receiver runs each snapshot
         │                          through diff::DiffDetector, then
         │                          parser::parse_item on each changed
@@ -241,7 +280,13 @@ skyblock-flipper/
         │                          or its same-tick siblings. NOTE:
         │                          "cheapest BIN this tick" remains a
         │                          placeholder value source, not a
-        │                          real fair-value estimate. Then runs
+        │                          real fair-value estimate; this
+        │                          entry's source is always
+        │                          PriceSource::Live (COFL-seeded
+        │                          entries only ever come from the
+        │                          background backfill task above and
+        │                          use PriceSource::Historical). Then
+        │                          runs
         │                          notify::FlipDeduplicator::filter_new
         │                          on the whole tick's flip_candidates
         │                          batch at once; for each surviving
@@ -287,26 +332,33 @@ skyblock-flipper/
     ├── parser/                    DONE: minimal item parser.
     │   src/lib.rs                  parse_item(&RawAuction) ->
     │                              Result<ParsedItem, ParseError>.
-    │                              Decodes item_bytes: base64 (base64
-    │                              crate) -> gzip (flate2) -> NBT
-    │                              (fastnbt). Extracts skyblock_item_id
-    │                              (ExtraAttributes.id), a color-code-
-    │                              stripped display_name, stack count,
-    │                              and the auction economics already on
-    │                              RawAuction. ExtraAttributes beyond
-    │                              `id` is kept as a raw fastnbt::Value
-    │                              (`extra_attributes` field) for the
-    │                              not-yet-built fingerprinting stage to
-    │                              interpret — deliberately not modeling
-    │                              every enchant/gem/hpb here, matching
-    │                              the two-tier lossy design in this
-    │                              file. Errors (bad base64, bad gzip,
-    │                              bad NBT, empty item list, missing
-    │                              skyblock id) are non-fatal to the
-    │                              pipeline — main.rs logs and skips.
-    │                              5 unit tests build synthetic item
-    │                              NBT with fastnbt's own nbt!/to_bytes
-    │                              and round-trip it through parse_item.
+    │                              Internally refactored (COFL session)
+    │                              into two reusable, standalone
+    │                              functions so a non-`RawAuction`
+    │                              caller can get the exact same
+    │                              decoding accuracy: decode_item_bytes
+    │                              (base64 -> gzip -> NBT, what
+    │                              parse_item itself calls) and
+    │                              decode_nbt_bytes (already-decompressed
+    │                              NBT -> DecodedItem, for callers whose
+    │                              bytes didn't arrive gzip-wrapped).
+    │                              Both return DecodedItem {
+    │                              skyblock_item_id, display_name,
+    │                              count, extra_attributes }; parse_item
+    │                              just attaches the RawAuction-specific
+    │                              fields (uuid, auctioneer,
+    │                              starting_bid, bin, end). The `cofl`
+    │                              crate calls decode_item_bytes/
+    │                              decode_nbt_bytes directly on COFL's
+    │                              shortItemBytes field instead of
+    │                              reconstructing ExtraAttributes from a
+    │                              separate, less complete field-by-
+    │                              field mapping — see the cofl entry
+    │                              below. This refactor is behavior-
+    │                              preserving: all 5 original unit tests
+    │                              (synthetic item NBT round-tripped
+    │                              through parse_item via fastnbt's own
+    │                              nbt!/to_bytes) pass unmodified.
     ├── fingerprint/                DONE: hot-path item fingerprinting.
     │   src/lib.rs                   fingerprint(&ParsedItem) ->
     │                               Fingerprint(u64). Pure/sync, no I/O,
@@ -390,11 +442,20 @@ skyblock-flipper/
     │                               get()). PriceEntry is a fixed-size
     │                               Copy struct: estimated_value (u64
     │                               coins), sample_size (u32),
-    │                               updated_at_tick (i64) — what
-    │                               estimated_value means (median?
-    │                               trimmed mean?) is deliberately left
-    │                               to the caller/profit engine, not
-    │                               this crate. 7 unit tests (empty
+    │                               updated_at_tick (i64 — actually a
+    │                               raw Hypixel epoch-millis timestamp
+    │                               despite the "tick" name; see the
+    │                               engine entry's bug-fix note below),
+    │                               and (added in the COFL session)
+    │                               source: PriceSource (Live |
+    │                               Historical) so engine::evaluate can
+    │                               apply a different staleness ceiling
+    │                               to a live-fed price vs a COFL-
+    │                               backfilled one. What estimated_value
+    │                               means (median? trimmed mean?) is
+    │                               still deliberately left to the
+    │                               caller/profit engine, not this
+    │                               crate. 7 unit tests (empty
     │                               cache, insert/read, overwrite,
     │                               500 entries across shards, empty
     │                               batch no-op, concurrent same-shard
@@ -468,6 +529,40 @@ skyblock-flipper/
     │                               measured separately in pricing),
     │                               since evaluate() takes an already-
     │                               resolved price.
+    │                               **CONFIRMED BUG FIXED (COFL
+    │                               session):** `tick`/`updated_at_tick`
+    │                               are raw Hypixel epoch-millis, not a
+    │                               small sequential counter, but
+    │                               FlipThresholds::default().
+    │                               max_price_age_ticks was `5` — i.e.
+    │                               5 *milliseconds*. Since Hypixel's
+    │                               cache refreshes every ~60,000ms, no
+    │                               live-fed price could ever survive
+    │                               to the next tick; every one was
+    │                               already stale by the time it could
+    │                               be reused. This is very likely a
+    │                               major contributor to the
+    │                               flips_found=0 issue below,
+    │                               independent of the fingerprint-
+    │                               sparsity hypothesis. Fixed: default
+    │                               is now 180_000 (3 minutes) for
+    │                               PriceSource::Live, plus a new
+    │                               max_historical_price_age_ticks
+    │                               field (default 30 days) applied
+    │                               instead when the entry's source is
+    │                               PriceSource::Historical — evaluate()
+    │                               picks the ceiling based on
+    │                               entry.source. 5 new tests cover
+    │                               this: a regression test asserting
+    │                               the default survives at least one
+    │                               ~60s tick interval, a live price a
+    │                               few ticks old still usable, a
+    │                               historical price days old still
+    │                               usable, a historical price beyond
+    │                               30 days stale, and the same age
+    │                               being fine for Historical but stale
+    │                               for Live (proving the two ceilings
+    │                               aren't conflated).
     ├── notify/                     DONE: flip dedup + WebSocket
     │   src/lib.rs                  notification.
     │                               FlipAlert { auction_uuid,
@@ -533,6 +628,95 @@ skyblock-flipper/
     │                               client, publishes, and asserts the
     │                               client receives the correctly-
     │                               shaped JSON.
+    ├── cofl/                       DONE: COFL historical pricing
+    │   src/lib.rs                  backend (Coflnet, sky.coflnet.com).
+    │                               Investigated via Coflnet's own
+    │                               auto-generated OpenAPI TypeScript
+    │                               client (Coflnet/hypixel-react on
+    │                               GitHub) since sky.coflnet.com itself
+    │                               403s non-browser fetches from this
+    │                               sandbox, same limitation as
+    │                               api.hypixel.net — see the crate's
+    │                               module doc comment for the full
+    │                               confirmed-vs-assumed breakdown.
+    │                               Pipeline: GET /api/auctions/tag/
+    │                               {tag}/sold (paginated, no server-
+    │                               side attribute filter, confirmed
+    │                               free/public, ~30req/10s+100req/min
+    │                               rate limit) -> CoflSoldAuction (raw
+    │                               wire struct, every uncertain field
+    │                               Option<> so a mismatch degrades a
+    │                               field, not the whole record) ->
+    │                               HistoricalSale (normalized, network-
+    │                               independent, unit tested without
+    │                               wiremock) -> fingerprint_of()
+    │                               (builds a synthetic ParsedItem,
+    │                               calls the SAME fingerprint::
+    │                               fingerprint() live auctions use —
+    │                               not a parallel implementation) ->
+    │                               grouped by Fingerprint, median sale
+    │                               price -> PriceEntry { source:
+    │                               Historical } -> PriceCache::
+    │                               update_batch(). Two-tier accuracy:
+    │                               primary path decodes SoldAuction.
+    │                               shortItemBytes ("NBT data as base64
+    │                               encoded string" per its doc comment)
+    │                               via parser::decode_item_bytes (or
+    │                               decode_nbt_bytes if the gzip-
+    │                               wrapped attempt fails, in case
+    │                               "short" means no gzip) — when this
+    │                               succeeds it's byte-for-byte the
+    │                               same ExtraAttributes a live auction
+    │                               would produce, zero guessing.
+    │                               Fallback (ReconstructedAttributes):
+    │                               reforge from flattenedNbt["modifier"],
+    │                               enchantments from the structured
+    │                               enchantments[] field (each type
+    │                               name run through pascal_to_snake —
+    │                               the single highest-risk assumption
+    │                               in this crate: unconfirmed whether
+    │                               COFL serializes enum names as
+    │                               PascalCase strings or numeric ids;
+    │                               numeric ids get an opaque
+    │                               unknown_{n} label so they at least
+    │                               group self-consistently), stars/
+    │                               recomb/hpc/aow/enrichment/skin from
+    │                               flattenedNbt using the same assumed
+    │                               key names fingerprint already uses.
+    │                               Gems/runes/ability scrolls are
+    │                               deliberately left unpopulated in
+    │                               the fallback — no confirmed
+    │                               flattening convention for nested/
+    │                               list NBT in a flat string map, and
+    │                               an absent modifier degrades
+    │                               gracefully where a wrong guess
+    │                               would silently corrupt the
+    │                               fingerprint. ImportStats tracks
+    │                               (all 3 requirements from the task):
+    │                               item_tags_attempted, sales_fetched,
+    │                               fingerprints_loaded,
+    │                               cache_entries_seeded, fetch_errors,
+    │                               and sales_from_real_nbt vs
+    │                               sales_from_reconstruction (the
+    │                               single most useful live-run signal
+    │                               for judging whether the
+    │                               shortItemBytes assumption held).
+    │                               backfill() rate-limits itself
+    │                               (350ms between requests) and is
+    │                               meant to run once at startup,
+    │                               concurrently with (not blocking)
+    │                               ingestion — see main.rs above. 13
+    │                               unit tests, including one proving
+    │                               the shortItemBytes decode path
+    │                               produces byte-identical fingerprints
+    │                               to a live auction, one proving the
+    │                               reconstruction fallback matches the
+    │                               real-NBT path when the assumed key
+    │                               names hold (a regression check on
+    │                               the assumptions themselves), and a
+    │                               wiremock-based end-to-end test of
+    │                               backfill() seeding the cache from a
+    │                               multi-sale, multi-page response.
     └── storage/                   DONE: async auction/price storage.
         src/lib.rs                  SnapshotStore::open(db_path) opens
                                    (creates) a SQLite file (rusqlite,
@@ -580,32 +764,40 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   at ~46,800 auctions each (e.g. `tick=1785736343562 auctions=46840`).
   The "not yet verified" caveat from earlier sessions is resolved.
 - `cargo build --workspace` — passes (debug and `--release`)
-- `cargo test --workspace` — passes (55 run + 2 `#[ignore]`'d
-  benchmarks = 57 tests: 1 common, 6 diff, 5 parser, 11 fingerprint, 7
-  pricing (+1 benchmark), 13 engine (+1 benchmark), 9 notify, 4
+- `cargo test --workspace` — passes (75 run + 2 `#[ignore]`'d
+  benchmarks = 77 tests: 1 common, 6 diff, 5 parser, 11 fingerprint, 7
+  pricing (+1 benchmark), 18 engine (+1 benchmark, +5 new staleness
+  tests from the COFL session's bug fix), 9 notify, 13 cofl, 4
   storage, 1 ingestion wiremock integration, plus doc-tests), on
   rustc 1.94 (the `url`/`idna` pin from the toolchain notes below was
   not needed)
 - `cargo clippy --workspace --all-targets` — clean on `parser`,
-  `storage`, `fingerprint`, `pricing`, `engine`, `notify`, and
+  `storage`, `fingerprint`, `pricing`, `engine`, `notify`, `cofl`, and
   `common`; pre-existing doc-comment lint warnings remain in
   `ingestion/src/lib.rs` only (unrelated to this session's changes)
 - `ingestion-service` now runs the complete pipeline end to end:
   diff → parse → fingerprint → evaluate → dedup → publish (WebSocket)
-  → price cache update → store, per snapshot. See the
+  → price cache update → store, per snapshot, with the COFL backfill
+  seeding the cache concurrently in the background at startup. See the
   `crates/ingestion/src/main.rs` entry above for the exact wiring, the
   evaluate-before-update ordering requirement, the dedup-before-
   publish ordering, and the "cheapest BIN this tick" placeholder-
-  pricing caveat (still unaddressed).
+  pricing caveat (still unaddressed for the *live* feed specifically —
+  COFL now covers the historical/startup case).
 - **Manually smoke-tested**: started `target/release/ingestion-service`
-  with a fake API key — confirmed the WebSocket listener binds and
-  logs "websocket notification server listening" *before* the
-  ingestion loop attempts its first Hypixel request, and that the
-  process still exits cleanly (non-zero, no panic) when that request
-  fails in this network-restricted sandbox. Did not verify an actual
-  end-to-end flip alert against live Hypixel data (no network access
-  here) — the `notify` crate's own integration test covers the
-  publish-to-connected-client path with a real socket instead.
+  with a fake API key, both with `COFL_BACKFILL_ENABLED=true` and
+  `=false` — confirmed the WebSocket listener binds and logs
+  "websocket notification server listening" *before* the ingestion
+  loop attempts its first Hypixel request, that the COFL-disabled path
+  logs and skips cleanly, and that the process still exits cleanly
+  (non-zero, no panic) when the Hypixel request fails in this
+  network-restricted sandbox (which also can't reach
+  `sky.coflnet.com`, so the enabled path's actual backfill attempt was
+  not observed completing or failing — only that it didn't crash
+  startup). Did not verify an actual end-to-end flip alert or COFL
+  backfill against live data — the `notify` and `cofl` crates' own
+  integration tests cover their respective paths with a real socket /
+  wiremock server instead.
 - `pricing::PriceCache::get` benchmarked at ~55 ns/op over 50,000
   entries; `engine::evaluate` benchmarked at ~2.9 ns/op (excludes the
   cache lookup itself) — both release build, single-threaded. See the
@@ -633,7 +825,7 @@ wasn't in scope for the cache, but it's the natural next lever once
 the core pipeline (steps 7-9) is complete, or worth an early
 Phase 3-style pass if it's blocking real usage sooner.
 
-## Known issue: flips_found=0 on live runs (diagnosis in progress)
+## Known issue: flips_found=0 on live runs (partially fixed this session)
 
 A live run reported `flips_found=0` and `below_threshold=0` on every
 tick — i.e. essentially nothing reaches `engine::evaluate` far enough
@@ -641,6 +833,32 @@ to even hit the min-profit/min-ROI check, let alone pass it. This
 confirms the "Replace the placeholder pricing feed" item flagged (but
 never acted on) since Phase 1.6 was not just a nice-to-have — it looks
 like the actual root cause of zero detections.
+
+**Update from the COFL integration session — a second, independently
+confirmed root cause found and fixed, plus a mitigation for the first
+one:**
+1. **Confirmed (not hypothesized) via code review**: `engine::
+   FlipThresholds::default().max_price_age_ticks` was `5`, compared
+   directly against millisecond deltas (`tick` is Hypixel's raw
+   epoch-millis `lastUpdated`, not a small counter, despite the name).
+   Hypixel's cache refreshes every ~60,000ms, so *no* live-fed price
+   could ever survive to the next tick — every one was stale
+   immediately. This alone could fully explain `flips_found=0`
+   independent of the fingerprint-sparsity hypothesis below. **Fixed**:
+   see the `engine` crate entry above (new default 180_000ms / 3
+   minutes for live prices, plus a separate 30-day ceiling for
+   historical ones).
+2. The fingerprint-sparsity hypothesis below is **still valid and
+   unconfirmed against live data**, but the COFL backfill (new `cofl`
+   crate) now directly mitigates it for high-value items: instead of
+   waiting for two live auctions to coincidentally share an exact
+   fingerprint, `PriceCache` can be seeded at startup with historical
+   sold-auction data for specific fingerprints.
+
+Both fixes together should meaningfully change the picture on the next
+live run — worth re-running with the `diag_*` fields below (now
+including `diag_historical_price_hit_total`) before assuming anything
+else is wrong.
 
 **Root-cause hypothesis, grounded in code review (not yet confirmed
 against live data — this sandbox has no network access to
@@ -680,9 +898,11 @@ insert-then-get works correctly. The mechanism is sound; it's being
 fed data that structurally can't produce hits for uniquely-modified
 items.
 
-**What was added this session (not a fix — diagnostics only, per
-explicit instruction to diagnose before changing behavior):**
-`ingestion-service`'s receiver task now tracks cumulative-since-start
+**What was added (not a fix at the time — diagnostics only, per
+explicit instruction to diagnose before changing behavior; the
+staleness bug fix above came from a *separate* task's explicit
+instructions, not from loosening these diagnostics' findings):**
+`ingestion-service`'s receiver task tracks cumulative-since-start
 counters for every `FlipVerdict` variant
 (`diag_evaluated_total`, `diag_cache_hit_total`, `diag_not_bin_total`,
 `diag_no_price_data_total`, `diag_insufficient_sample_total`,
@@ -692,38 +912,63 @@ counters for every `FlipVerdict` variant
 (tracked across `Flip`, `BelowThreshold`, *and* `ImplausibleRoi` — a
 high implausible-ROI max would itself be a signal that
 `max_plausible_roi_percent` is rejecting genuine rare-item flips, not
-just bad data). All clearly marked `// TEMPORARY DIAGNOSTIC
-INSTRUMENTATION` in `main.rs`, meant to be removed once the root cause
-is confirmed and fixed, not left in permanently. Cumulative rather
-than per-tick because diff detection can make any single tick's
-evaluated-auction count too small to read anything from.
-Zero added hot-path cost beyond a few extra integer compares/increments
-per already-evaluated auction — no new I/O, allocation, or locking.
+just bad data), and (added in the COFL session)
+`diag_historical_price_hit_total` — how many evaluated auctions hit a
+`PriceSource::Historical` (COFL-seeded) cache entry specifically. All
+clearly marked `// TEMPORARY DIAGNOSTIC INSTRUMENTATION` in `main.rs`,
+meant to be removed once the root cause is confirmed and fixed, not
+left in permanently. Cumulative rather than per-tick because diff
+detection can make any single tick's evaluated-auction count too small
+to read anything from. Zero added hot-path cost beyond a few extra
+integer compares/increments per already-evaluated auction — no new
+I/O, allocation, or locking.
 
 **What to look for in the next live run's logs** to confirm/refute the
-hypothesis: `diag_no_price_data_total` should dominate every other
-counter by a wide margin, `diag_cache_hit_total` should be small
-relative to `diag_evaluated_total`, and `diag_max_roi_percent_ever`
-being populated (even via the `ImplausibleRoi` path) would mean real
-opportunities are being seen but rejected, not that nothing's out
-there at all.
+remaining (fingerprint-sparsity) hypothesis, now that the staleness
+bug is fixed: `diag_no_price_data_total` should still dominate for
+uniquely-modified items even with fresh live data, `diag_cache_hit_total`
+should be small relative to `diag_evaluated_total` for the *live* feed
+specifically, `diag_historical_price_hit_total` being nonzero confirms
+the COFL backfill is actually reaching evaluate() (and `cofl::
+ImportStats.sales_from_real_nbt` vs `sales_from_reconstruction`,
+logged separately at startup, tells you whether COFL's `shortItemBytes`
+assumption held — see the `cofl` crate entry above), and
+`diag_max_roi_percent_ever` being populated (even via the
+`ImplausibleRoi` path) would mean real opportunities are being seen
+but rejected, not that nothing's out there at all.
 
-**Not yet decided — needs the confirmed numbers first:** if this
-hypothesis holds, the real fix is a pricing-strategy change (e.g. a
-coarser fallback fingerprint tier — item id + only the modifiers that
-matter most, ignoring the long tail — used when the exact fingerprint
-misses; or seeding/backfilling the cache from `storage`'s accumulating
-history instead of only this tick's new listings), not lowering
+**Not yet decided — needs the confirmed numbers first:** whether the
+COFL backfill alone resolves the fingerprint-sparsity hypothesis for
+the item tags it covers, or whether a coarser fallback fingerprint
+tier (item id + only the modifiers that matter most, used when the
+exact fingerprint misses) is still needed on top of it for items COFL
+doesn't cover or for the live feed between backfills. Not lowering
 thresholds or removing the plausibility/sample-size guards, which the
 user was explicit about not doing blindly.
 
 ## Immediate next step
 
-**Confirm the flips_found=0 diagnosis against a live run**, using the
-new `diag_*` fields above, before deciding on a fix. Once confirmed,
-the fix belongs in the pricing strategy (see the "not yet decided"
-note above), not in the engine's guards/thresholds. Other open items,
-unblocked by this and listed in priority-neutral order:
+**Run it live** — this is the single highest-value next action, not
+new code. Two independent, code-confirmed fixes (staleness bug) and
+mitigations (COFL backfill) landed this session for `flips_found=0`
+without ever having live Hypixel/COFL access to verify either one end
+to end. A live run would confirm or correct, in priority order:
+1. Whether `flips_found` is now nonzero at all.
+2. Whether `cofl::ImportStats` (logged at startup) shows
+   `sales_from_real_nbt > 0` — confirms the `shortItemBytes` decode
+   assumption, the single highest-leverage unverified assumption in
+   the whole COFL integration (if it's 0, everything fell back to
+   `ReconstructedAttributes`, and the `pascal_to_snake` enchant-name
+   assumption becomes the next thing to check).
+3. Whether `diag_historical_price_hit_total` is nonzero — confirms
+   COFL-seeded prices are actually reaching `evaluate()`.
+4. Whether `diag_no_price_data_total` still dominates for the *live*
+   feed specifically (now that staleness isn't confounding the
+   reading) — confirms or refutes how much the fingerprint-sparsity
+   hypothesis still matters beyond what COFL covers.
+
+Other open items, unblocked by this and listed in priority-neutral
+order:
 
 1. **Ingestion latency.** Flagged since Phase 1.6, still real:
    `detect_latency_ms=238`, `snapshot_fetch_latency_ms=1074` from a

@@ -1,10 +1,11 @@
+use cofl::CoflClient;
 use common::{AuctionSnapshot, Config};
 use diff::DiffDetector;
 use engine::{FeeSchedule, FlipThresholds, FlipVerdict};
 use fingerprint::Fingerprint;
 use ingestion::HypixelClient;
 use notify::{FlipAlert, FlipDeduplicator, NotificationHub};
-use pricing::{PriceCache, PriceEntry};
+use pricing::{PriceCache, PriceEntry, PriceSource};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use storage::SnapshotStore;
@@ -30,6 +31,10 @@ async fn main() {
 
     let storage_db_path = config.storage_db_path.clone();
     let websocket_bind_addr = config.websocket_bind_addr.clone();
+    let cofl_backfill_enabled = config.cofl_backfill_enabled;
+    let cofl_base_url = config.cofl_base_url.clone();
+    let cofl_backfill_item_tags = config.cofl_backfill_item_tags.clone();
+    let cofl_backfill_pages_per_tag = config.cofl_backfill_pages_per_tag;
 
     let client = match HypixelClient::new(config) {
         Ok(client) => client,
@@ -62,6 +67,37 @@ async fn main() {
     info!(addr = %websocket_bind_addr, "websocket notification server listening");
 
     let price_cache = Arc::new(PriceCache::new());
+
+    // COFL historical-price backfill: runs once, entirely in the
+    // background, concurrently with ingestion startup below (not
+    // awaited, so a slow/rate-limited backfill can never delay the
+    // sniper path's first tick). It only ever calls
+    // PriceCache::update_batch, the same non-blocking write path the
+    // live feed uses further down — the hot path (PriceCache::get,
+    // engine::evaluate) has no idea whether an entry came from here or
+    // a live tick. See the cofl crate for the investigation behind this
+    // and its confirmed-vs-assumed caveats.
+    if cofl_backfill_enabled {
+        let backfill_cache = Arc::clone(&price_cache);
+        tokio::spawn(async move {
+            let client = match CoflClient::new(cofl_base_url) {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(error = %err, "failed to construct COFL client; skipping historical backfill");
+                    return;
+                }
+            };
+            cofl::backfill(
+                &client,
+                &cofl_backfill_item_tags,
+                cofl_backfill_pages_per_tag,
+                &backfill_cache,
+            )
+            .await;
+        });
+    } else {
+        info!("COFL historical backfill disabled (COFL_BACKFILL_ENABLED=false)");
+    }
 
     // Placeholder defaults; claude.md's Phase 2 website already
     // anticipates user-configurable min-profit/min-ROI settings, which
@@ -99,6 +135,11 @@ async fn main() {
         let mut diag_below_threshold_total: u64 = 0;
         let mut diag_max_expected_profit_ever: Option<i64> = None;
         let mut diag_max_roi_percent_ever: Option<f64> = None;
+        // Requirement from the COFL integration task: how many
+        // evaluated auctions had a cache hit whose price came from the
+        // COFL backfill (PriceSource::Historical) rather than a live
+        // tick's own observations.
+        let mut diag_historical_price_hit_total: u64 = 0;
 
         while let Some(snapshot) = rx.recv().await {
             let tick = snapshot.last_updated;
@@ -139,8 +180,11 @@ async fn main() {
                 let cached_price = price_cache.get(fp);
 
                 diag_evaluated_total += 1;
-                if cached_price.is_some() {
+                if let Some(price) = cached_price {
                     diag_cache_hit_total += 1;
+                    if price.source == PriceSource::Historical {
+                        diag_historical_price_hit_total += 1;
+                    }
                 }
 
                 match engine::evaluate(item, cached_price, tick, &fee_schedule, &flip_thresholds) {
@@ -214,6 +258,7 @@ async fn main() {
                             estimated_value: item.starting_bid,
                             sample_size: 1,
                             updated_at_tick: tick,
+                            source: PriceSource::Live,
                         });
                 }
             }
@@ -266,6 +311,7 @@ async fn main() {
                 // flips_found=0 root cause is confirmed and fixed.
                 diag_evaluated_total,
                 diag_cache_hit_total,
+                diag_historical_price_hit_total,
                 diag_not_bin_total,
                 diag_no_price_data_total,
                 diag_insufficient_sample_total,

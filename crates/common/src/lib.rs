@@ -70,6 +70,18 @@ pub struct Config {
     /// Bind address for the WebSocket flip-notification server (see
     /// `notify` crate).
     pub websocket_bind_addr: String,
+    /// Whether to run the COFL historical-price backfill at startup
+    /// (see `cofl` crate). Off by default in environments without
+    /// network access to `sky.coflnet.com`.
+    pub cofl_backfill_enabled: bool,
+    /// Base URL for the COFL (Coflnet, sky.coflnet.com) REST API.
+    pub cofl_base_url: String,
+    /// SkyBlock item tags to backfill historical prices for at startup.
+    /// A deliberately short starter list of high-value items, not an
+    /// attempt to cover the whole catalog — see the `cofl` crate.
+    pub cofl_backfill_item_tags: Vec<String>,
+    /// How many pages of sold-auction history to fetch per item tag.
+    pub cofl_backfill_pages_per_tag: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +130,38 @@ impl Config {
         let websocket_bind_addr =
             env::var("WEBSOCKET_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:9001".to_string());
 
+        let cofl_backfill_enabled = env::var("COFL_BACKFILL_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .map_err(|_| {
+                ConfigError::InvalidVar(
+                    "COFL_BACKFILL_ENABLED".into(),
+                    "expected \"true\" or \"false\"".into(),
+                )
+            })?;
+
+        let cofl_base_url =
+            env::var("COFL_BASE_URL").unwrap_or_else(|_| "https://sky.coflnet.com/api".to_string());
+
+        let cofl_backfill_item_tags = env::var("COFL_BACKFILL_ITEM_TAGS")
+            .unwrap_or_else(|_| {
+                "HYPERION,NECRON_HANDLE,ASTRAEA,SCYLLA,VALKYRIE,ASPECT_OF_THE_END".to_string()
+            })
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let cofl_backfill_pages_per_tag = env::var("COFL_BACKFILL_PAGES_PER_TAG")
+            .unwrap_or_else(|_| "3".to_string())
+            .parse::<u32>()
+            .map_err(|_| {
+                ConfigError::InvalidVar(
+                    "COFL_BACKFILL_PAGES_PER_TAG".into(),
+                    "expected a non-negative integer".into(),
+                )
+            })?;
+
         Ok(Config {
             hypixel_api_key,
             hypixel_base_url,
@@ -125,6 +169,10 @@ impl Config {
             request_timeout_ms,
             storage_db_path,
             websocket_bind_addr,
+            cofl_backfill_enabled,
+            cofl_base_url,
+            cofl_backfill_item_tags,
+            cofl_backfill_pages_per_tag,
         })
     }
 }

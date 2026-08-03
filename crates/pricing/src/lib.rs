@@ -71,20 +71,43 @@ impl Hasher for FingerprintHasher {
 type FingerprintBuildHasher = BuildHasherDefault<FingerprintHasher>;
 type ShardMap = HashMap<Fingerprint, PriceEntry, FingerprintBuildHasher>;
 
+/// Where a [`PriceEntry`] came from. The profit engine applies a
+/// different staleness allowance to each: `Live` prices are a snapshot
+/// of this tick's own market and go stale within minutes, while
+/// `Historical` prices (backfilled from COFL at startup — see the
+/// `cofl` crate) represent a longer-run fair-value baseline that's
+/// still legitimately useful hours or days later. Conflating the two
+/// under one staleness policy would either make live prices too
+/// trusting or historical prices useless immediately after import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceSource {
+    /// Derived from an auction observed on a recent live ingestion tick.
+    Live,
+    /// Backfilled from historical sold-auction data (COFL) at startup.
+    Historical,
+}
+
 /// The minimum data needed for instant valuation of a fingerprinted
 /// item: an estimated per-unit value plus enough context (sample size,
-/// last-updated tick) for the profit calculator to judge how much to
-/// trust it. Fixed-size and `Copy` — a cache hit is a memcpy, not an
-/// allocation.
+/// last-updated tick, source) for the profit calculator to judge how
+/// much to trust it. Fixed-size and `Copy` — a cache hit is a memcpy,
+/// not an allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PriceEntry {
     /// Estimated per-unit value, in coins.
     pub estimated_value: u64,
     /// How many observations this estimate is derived from.
     pub sample_size: u32,
-    /// The ingestion tick (Hypixel `lastUpdated` millis) this estimate
-    /// was last refreshed at, so a consumer can judge staleness.
+    /// Despite the name (kept consistent with the rest of the pipeline,
+    /// which calls Hypixel's `lastUpdated` value "tick" throughout),
+    /// this is a raw Hypixel epoch-millis timestamp, not a small
+    /// sequential counter — compared directly against `evaluate`'s
+    /// `current_tick` argument, which is the same kind of value. See
+    /// `engine::FlipThresholds` for the staleness comparison and the
+    /// bug that comparing this against a tiny default once caused.
     pub updated_at_tick: i64,
+    /// Where this estimate came from — see [`PriceSource`].
+    pub source: PriceSource,
 }
 
 #[inline]
@@ -185,6 +208,7 @@ mod tests {
             estimated_value: value,
             sample_size: 1,
             updated_at_tick: 1_000,
+            source: PriceSource::Live,
         }
     }
 
@@ -321,6 +345,7 @@ mod bench {
                         estimated_value: i * 1_000,
                         sample_size: 1,
                         updated_at_tick: 1,
+                        source: PriceSource::Live,
                     },
                 )
             })

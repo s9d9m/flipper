@@ -34,9 +34,23 @@
 //! no network access to confirm it (same situation as the fingerprint
 //! crate's NBT tag names). It's one config value to correct once
 //! verified, not a redesign.
+//!
+//! # `tick` is epoch-millis, not a small counter (bug fixed here)
+//!
+//! `current_tick`/`PriceEntry::updated_at_tick` are Hypixel's raw
+//! `lastUpdated` value — epoch milliseconds, passed straight through the
+//! whole pipeline as `tick`. An earlier version of
+//! `FlipThresholds::default()` set `max_price_age_ticks: 5`, which reads
+//! as "5 ticks" but was actually being compared against millisecond
+//! deltas — i.e. 5 *milliseconds*. Since Hypixel's cache refreshes every
+//! ~60,000ms, that meant no cached price could ever survive from one
+//! tick to the next; every live-fed price was already stale by the time
+//! it could possibly be reused. The default is now denominated correctly
+//! (see [`FlipThresholds`]). This is restoring a broken guard to work as
+//! documented, not loosening it.
 
 use parser::ParsedItem;
-use pricing::PriceEntry;
+use pricing::{PriceEntry, PriceSource};
 
 /// Resale tax model applied to `estimated_value` when computing net
 /// proceeds. See the module-level fee schedule caveat.
@@ -84,9 +98,17 @@ pub struct FlipThresholds {
     pub min_roi_percent: f64,
     /// Minimum `PriceEntry.sample_size` to trust a cached price at all.
     pub min_sample_size: u32,
-    /// Maximum age (in ticks) of a cached price before it's considered
-    /// stale and skipped rather than trusted.
+    /// Maximum age, in milliseconds (despite the name — see the module
+    /// doc comment), of a `PriceSource::Live` cached price before it's
+    /// considered stale and skipped rather than trusted.
     pub max_price_age_ticks: i64,
+    /// Maximum age, in milliseconds, of a `PriceSource::Historical`
+    /// cached price (backfilled from COFL) before it's considered stale.
+    /// Deliberately much larger than `max_price_age_ticks`: historical
+    /// data represents a longer-run fair-value baseline, not a live
+    /// snapshot, so it stays useful far longer than a live observation
+    /// does.
+    pub max_historical_price_age_ticks: i64,
     /// ROI above this percentage is treated as implausible — more
     /// likely a bad cache entry (fingerprint collision, a troll listing
     /// skewing the cheapest-BIN sample) than a real flip — and rejected
@@ -101,7 +123,16 @@ impl Default for FlipThresholds {
             min_profit: 100_000,
             min_roi_percent: 10.0,
             min_sample_size: 1,
-            max_price_age_ticks: 5,
+            // 3 minutes: Hypixel's cache refreshes roughly every 60s
+            // (per claude.md), so this gives a live-fed price a few
+            // ticks of slack to be reused before it's considered stale.
+            // See the module doc comment for the bug this default fixes
+            // (it used to be the nonsensical literal value `5`, i.e. 5
+            // milliseconds).
+            max_price_age_ticks: 180_000,
+            // 30 days: historical data is a slower-moving baseline, not
+            // a live snapshot.
+            max_historical_price_age_ticks: 30 * 24 * 60 * 60 * 1000,
             max_plausible_roi_percent: 1_000.0,
         }
     }
@@ -187,7 +218,11 @@ pub fn evaluate(
     }
 
     let age_ticks = current_tick.saturating_sub(entry.updated_at_tick).max(0);
-    if age_ticks > thresholds.max_price_age_ticks {
+    let staleness_limit = match entry.source {
+        PriceSource::Live => thresholds.max_price_age_ticks,
+        PriceSource::Historical => thresholds.max_historical_price_age_ticks,
+    };
+    if age_ticks > staleness_limit {
         return FlipVerdict::StalePrice { age_ticks };
     }
 
@@ -270,6 +305,20 @@ mod tests {
             estimated_value,
             sample_size,
             updated_at_tick,
+            source: PriceSource::Live,
+        }
+    }
+
+    fn historical_price(
+        estimated_value: u64,
+        sample_size: u32,
+        updated_at_tick: i64,
+    ) -> PriceEntry {
+        PriceEntry {
+            estimated_value,
+            sample_size,
+            updated_at_tick,
+            source: PriceSource::Historical,
         }
     }
 
@@ -332,6 +381,84 @@ mod tests {
             &thresholds,
         );
         assert_eq!(verdict, FlipVerdict::StalePrice { age_ticks: 10 });
+    }
+
+    #[test]
+    fn default_live_staleness_survives_at_least_one_hypixel_tick_interval() {
+        // Regression test for the bug documented in the module doc
+        // comment: max_price_age_ticks is compared against millisecond
+        // deltas, and Hypixel's cache refreshes roughly every 60_000ms
+        // (per claude.md). The old default of `5` meant literally no
+        // live-fed price could ever survive to the next tick.
+        assert!(
+            FlipThresholds::default().max_price_age_ticks > 60_000,
+            "max_price_age_ticks must be large enough to survive at least \
+             one ~60s Hypixel tick interval, or every live price is stale \
+             immediately"
+        );
+    }
+
+    #[test]
+    fn live_price_a_few_ticks_old_is_still_usable_under_the_default() {
+        let thresholds = FlipThresholds::default();
+        // ~2 Hypixel tick intervals old (120s), well under the 3-minute
+        // default ceiling.
+        let verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(price(2_000_000, 5, 0)),
+            120_000,
+            &FeeSchedule::default(),
+            &thresholds,
+        );
+        assert!(!matches!(verdict, FlipVerdict::StalePrice { .. }));
+    }
+
+    #[test]
+    fn historical_price_days_old_is_still_usable() {
+        let thresholds = FlipThresholds::default();
+        let seven_days_ms = 7 * 24 * 60 * 60 * 1000;
+
+        let verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(historical_price(2_000_000, 5, 0)),
+            seven_days_ms,
+            &FeeSchedule::default(),
+            &thresholds,
+        );
+        assert!(!matches!(verdict, FlipVerdict::StalePrice { .. }));
+    }
+
+    #[test]
+    fn historical_price_beyond_its_own_ceiling_is_stale() {
+        let thresholds = FlipThresholds::default();
+        let ninety_days_ms = 90 * 24 * 60 * 60 * 1000;
+
+        let verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(historical_price(2_000_000, 5, 0)),
+            ninety_days_ms,
+            &FeeSchedule::default(),
+            &thresholds,
+        );
+        assert!(matches!(verdict, FlipVerdict::StalePrice { .. }));
+    }
+
+    #[test]
+    fn live_price_that_would_be_fine_if_historical_is_stale_as_live() {
+        // Same age as historical_price_days_old_is_still_usable above,
+        // but source: Live -- must use the much shorter live ceiling,
+        // not the historical one, proving the two are not conflated.
+        let thresholds = FlipThresholds::default();
+        let seven_days_ms = 7 * 24 * 60 * 60 * 1000;
+
+        let verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(price(2_000_000, 5, 0)),
+            seven_days_ms,
+            &FeeSchedule::default(),
+            &thresholds,
+        );
+        assert!(matches!(verdict, FlipVerdict::StalePrice { .. }));
     }
 
     #[test]
@@ -521,6 +648,7 @@ mod bench {
             estimated_value: 1_500_000,
             sample_size: 5,
             updated_at_tick: 1,
+            source: PriceSource::Live,
         };
         let fees = FeeSchedule::default();
         let thresholds = FlipThresholds::default();

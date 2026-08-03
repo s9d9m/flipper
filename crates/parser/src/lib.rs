@@ -85,14 +85,30 @@ struct Display {
     name: Option<String>,
 }
 
-/// Decodes a single auction's `item_bytes` into a `ParsedItem`.
-pub fn parse_item(raw: &RawAuction) -> Result<ParsedItem, ParseError> {
-    let compressed = BASE64_STANDARD.decode(&raw.item_bytes)?;
+/// The result of decoding just an item's NBT, independent of which
+/// auction (if any) it came from. [`parse_item`] calls
+/// [`decode_item_bytes`] and attaches the `RawAuction`-specific fields
+/// (uuid, auctioneer, starting_bid, bin, end); other callers with item
+/// NBT from a different source (e.g. the `cofl` crate's historical
+/// price importer, decoding a third-party API's copy of an item's NBT)
+/// can call [`decode_item_bytes`] or [`decode_nbt_bytes`] directly to
+/// get the exact same accuracy a live auction would have, instead of
+/// reconstructing `extra_attributes` from a separate, less complete
+/// field-by-field mapping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedItem {
+    pub skyblock_item_id: String,
+    pub display_name: String,
+    pub count: i8,
+    pub extra_attributes: Option<Value>,
+}
 
-    let mut decompressed = Vec::new();
-    flate2::read::GzDecoder::new(compressed.as_slice()).read_to_end(&mut decompressed)?;
-
-    let root: NbtRoot = fastnbt::from_bytes(&decompressed)?;
+/// Decodes already-decompressed NBT bytes (no base64, no gzip) into a
+/// [`DecodedItem`]. Exposed separately from [`decode_item_bytes`] for
+/// callers whose NBT bytes didn't arrive gzip-wrapped the way Hypixel's
+/// own `item_bytes` does.
+pub fn decode_nbt_bytes(nbt_bytes: &[u8]) -> Result<DecodedItem, ParseError> {
+    let root: NbtRoot = fastnbt::from_bytes(nbt_bytes)?;
     let item = root.i.into_iter().next().ok_or(ParseError::EmptyItemList)?;
 
     let tag = item.tag;
@@ -109,16 +125,39 @@ pub fn parse_item(raw: &RawAuction) -> Result<ParsedItem, ParseError> {
         .map(|name| strip_color_codes(&name))
         .unwrap_or_else(|| skyblock_item_id.clone());
 
-    Ok(ParsedItem {
-        uuid: raw.uuid.clone(),
-        auctioneer: raw.auctioneer.clone(),
+    Ok(DecodedItem {
         skyblock_item_id,
         display_name,
         count: item.count,
+        extra_attributes: extra_attributes.map(|attrs| attrs.rest.clone()),
+    })
+}
+
+/// Decodes base64-encoded, gzip-compressed item NBT (Hypixel's
+/// `item_bytes` wire format) into a [`DecodedItem`].
+pub fn decode_item_bytes(item_bytes: &str) -> Result<DecodedItem, ParseError> {
+    let compressed = BASE64_STANDARD.decode(item_bytes)?;
+
+    let mut decompressed = Vec::new();
+    flate2::read::GzDecoder::new(compressed.as_slice()).read_to_end(&mut decompressed)?;
+
+    decode_nbt_bytes(&decompressed)
+}
+
+/// Decodes a single auction's `item_bytes` into a `ParsedItem`.
+pub fn parse_item(raw: &RawAuction) -> Result<ParsedItem, ParseError> {
+    let decoded = decode_item_bytes(&raw.item_bytes)?;
+
+    Ok(ParsedItem {
+        uuid: raw.uuid.clone(),
+        auctioneer: raw.auctioneer.clone(),
+        skyblock_item_id: decoded.skyblock_item_id,
+        display_name: decoded.display_name,
+        count: decoded.count,
         starting_bid: raw.starting_bid,
         bin: raw.bin.unwrap_or(false),
         end: raw.end,
-        extra_attributes: extra_attributes.map(|attrs| attrs.rest.clone()),
+        extra_attributes: decoded.extra_attributes,
     })
 }
 
