@@ -132,7 +132,20 @@ hundreds of ms to seconds of pure waste versus active tick-detection.
    stage (step 9) needs.
 8. Flip detection (dedup + notification hookup) — **next step, not yet
    built**
-9. WebSocket notification server — not built
+9. WebSocket notification server — not built. **Requirement (not yet
+   implemented, deliberately deferred):** every flip alert payload must
+   include a clickable/copyable `/viewauction <uuid>` command, built
+   from the auction's uuid. This is a notification-payload-shape
+   requirement, not a hot-path change — `ParsedItem.uuid` (and thus
+   `RawAuction.uuid`) already flows through the whole pipeline
+   unmodified from ingestion through evaluate(), so building this
+   string is a trivial format!() at notification time, off the sniper
+   path. Do not add this to `engine::ProfitCalculation`/`FlipVerdict`
+   or anywhere upstream of step 9 — it belongs entirely in the
+   WebSocket stage. Consistent with (and satisfies) the Phase 2 website
+   section's `/viewauction copy button` note below; the alert payload
+   itself should already carry the ready-to-use command so the website
+   (or Discord, or any other client) doesn't need to reconstruct it.
 
 Target output of Phase 1: a user connects to the site and receives live
 profitable flip alerts.
@@ -545,4 +558,11 @@ distinct step is narrower than the original roadmap wording:
    even reach `Flip`.
 3. **WebSocket notification (step 9)** is the actual "send it
    somewhere" step and is still fully unbuilt — right now a "flip
-   detected" log line is the only output.
+   detected" log line is the only output. **New requirement to build
+   in when this happens:** every alert payload must include a
+   clickable/copyable `/viewauction <uuid>` command. Deliberately
+   deferred, not implemented now — the user was explicit this must not
+   touch the hot path. `ParsedItem.uuid` already flows through the
+   whole pipeline unmodified, so this is a `format!()` at
+   notification time and nothing upstream needs to change. See the
+   fuller note on step 9 in the Build order section above.
