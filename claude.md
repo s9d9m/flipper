@@ -130,25 +130,25 @@ hundreds of ms to seconds of pure waste versus active tick-detection.
    deduping so the same auction isn't re-reported as a flip on every
    tick it remains listed, plus whatever orchestration the notification
    stage (step 9) needs.
-8. Flip detection (dedup + notification hookup) — **next step, not yet
-   built**
-9. WebSocket notification server — not built. **Requirement (not yet
-   implemented, deliberately deferred):** every flip alert payload must
-   include a clickable/copyable `/viewauction <uuid>` command, built
-   from the auction's uuid. This is a notification-payload-shape
-   requirement, not a hot-path change — `ParsedItem.uuid` (and thus
-   `RawAuction.uuid`) already flows through the whole pipeline
-   unmodified from ingestion through evaluate(), so building this
-   string is a trivial format!() at notification time, off the sniper
-   path. Do not add this to `engine::ProfitCalculation`/`FlipVerdict`
-   or anywhere upstream of step 9 — it belongs entirely in the
-   WebSocket stage. Consistent with (and satisfies) the Phase 2 website
-   section's `/viewauction copy button` note below; the alert payload
-   itself should already carry the ready-to-use command so the website
-   (or Discord, or any other client) doesn't need to reconstruct it.
+8. Flip detection (dedup) ✅ done (see below)
+9. WebSocket notification server ✅ done (see below) — the
+   `/viewauction <uuid>` requirement from session chat is satisfied:
+   every `FlipAlert` carries a `viewauction_command` field built at
+   construction time.
 
-Target output of Phase 1: a user connects to the site and receives live
-profitable flip alerts.
+**All 9 numbered Phase 1 steps are now built.** Target output of
+Phase 1 ("a user connects to the site and receives live profitable
+flip alerts") is technically achievable today for any WebSocket
+client, though there's no *site* yet — that's Phase 2. What's left
+that isn't a numbered step:
+- The pricing feed is still `main.rs`'s placeholder "cheapest BIN
+  this tick," not a real fair-value estimate (noted since Phase 1.6,
+  never addressed — see the ingestion/main.rs entry below).
+- The ingestion tick-detection/fetch latency flagged below
+  (`detect_latency_ms=238`, `snapshot_fetch_latency_ms=1074`) still
+  dwarfs the rest of the compute pipeline and hasn't been touched.
+- Phase 2 (website) and Phase 3 (optimization) below are both
+  unstarted.
 
 **Phase 2 — Website:** live flip feed (item name, image, buy price,
 estimated value, profit, ROI, `/viewauction` copy button), user settings
@@ -170,7 +170,7 @@ skyblock-flipper/
 │                                comparing real release builds.
 ├── .env.example                 HYPIXEL_API_KEY, HYPIXEL_BASE_URL,
 │                                TICK_POLL_INTERVAL_MS, REQUEST_TIMEOUT_MS,
-│                                STORAGE_DB_PATH
+│                                STORAGE_DB_PATH, WEBSOCKET_BIND_ADDR
 ├── .gitignore
 ├── README.md                    Explains file-by-file purpose, setup,
 │                                and a toolchain gotcha (see below)
@@ -196,23 +196,35 @@ skyblock-flipper/
         │                          an mpsc channel. Does NOT parse
         │                          items, price anything, or decide
         │                          what's a flip.
-        src/main.rs                 Standalone runnable binary. Channel
-        │                          receiver runs each snapshot through
-        │                          diff::DiffDetector, then parser::
-        │                          parse_item on each changed auction
-        │                          (parse failures are logged and
-        │                          skipped, not fatal), then
+        src/main.rs                 Standalone runnable binary. Before
+        │                          the ingestion loop starts: binds the
+        │                          WebSocket listener via notify::
+        │                          NotificationHub::bind(&config.
+        │                          websocket_bind_addr) (hard error /
+        │                          process exit if the bind fails, same
+        │                          treatment as a storage-open failure),
+        │                          builds an Arc<NotificationHub>, and
+        │                          spawns NotificationHub::serve(...)
+        │                          as its own background task before
+        │                          the ingestion channel receiver task
+        │                          is even spawned.
+        │                          Channel receiver runs each snapshot
+        │                          through diff::DiffDetector, then
+        │                          parser::parse_item on each changed
+        │                          auction (parse failures are logged
+        │                          and skipped, not fatal), then
         │                          fingerprint::fingerprint on every
         │                          parsed item. For each item, looks up
         │                          pricing::PriceCache::get(fp) — the
         │                          cache's state from *prior* ticks —
         │                          and passes it to engine::evaluate().
-        │                          A FlipVerdict::Flip logs an info!
-        │                          "flip detected" line with the full
-        │                          profit breakdown (this is currently
-        │                          the only "notification" that
-        │                          exists — WebSocket notify is step 9,
-        │                          not yet built); BelowThreshold is
+        │                          A FlipVerdict::Flip builds a
+        │                          notify::FlipAlert (from ParsedItem +
+        │                          ProfitCalculation fields) and
+        │                          collects it into a per-tick
+        │                          flip_candidates Vec — it does NOT
+        │                          publish immediately, see dedup
+        │                          ordering below. BelowThreshold is
         │                          counted; every other verdict
         │                          (NotBin/NoPriceData/StalePrice/etc.)
         │                          is silently skipped. Only *after*
@@ -229,16 +241,25 @@ skyblock-flipper/
         │                          or its same-tick siblings. NOTE:
         │                          "cheapest BIN this tick" remains a
         │                          placeholder value source, not a
-        │                          real fair-value estimate. Then hands
-        │                          the parsed batch to storage::
-        │                          SnapshotStore::store(tick, items).
-        │                          Logs total/changed/parsed/failed/
-        │                          unique-fingerprint/priced-
-        │                          fingerprint counts, the price
-        │                          cache's total size, flips_found,
-        │                          below_threshold, and the diff
-        │                          detector's live-tracked count per
-        │                          snapshot.
+        │                          real fair-value estimate. Then runs
+        │                          notify::FlipDeduplicator::filter_new
+        │                          on the whole tick's flip_candidates
+        │                          batch at once; for each surviving
+        │                          (genuinely new) alert, calls
+        │                          notification_hub.publish(alert)
+        │                          (non-blocking) and logs a "flip
+        │                          detected" info! line with the full
+        │                          alert payload. Then hands the parsed
+        │                          batch to storage::SnapshotStore::
+        │                          store(tick, items). Logs total/
+        │                          changed/parsed/failed/unique-
+        │                          fingerprint/priced-fingerprint
+        │                          counts, the price cache's total
+        │                          size, flips_found (now: len of the
+        │                          deduped survivors, not raw Flip
+        │                          count), below_threshold, the diff
+        │                          detector's live-tracked count, and
+        │                          dedup.tracked_count() per snapshot.
         tests/tick_detection.rs      Integration test against a local
                                     wiremock mock server — proves
                                     tick-detection + concurrent-fetch +
@@ -447,6 +468,71 @@ skyblock-flipper/
     │                               measured separately in pricing),
     │                               since evaluate() takes an already-
     │                               resolved price.
+    ├── notify/                     DONE: flip dedup + WebSocket
+    │   src/lib.rs                  notification.
+    │                               FlipAlert { auction_uuid,
+    │                               viewauction_command, item_name,
+    │                               buy_price, estimated_value, profit,
+    │                               roi_percent, #[serde(skip)]
+    │                               auction_end } — the caller builds
+    │                               this from primitive ParsedItem +
+    │                               ProfitCalculation fields; this
+    │                               crate depends on neither `parser`
+    │                               nor `engine`, same decoupling
+    │                               reasoning as `engine` not depending
+    │                               on `pricing::PriceCache`. `new()`
+    │                               builds viewauction_command as
+    │                               `format!("/viewauction {uuid}")`.
+    │                               FlipDeduplicator: HashMap<uuid,
+    │                               auction_end> tracking already-
+    │                               alerted uuids — the exact same
+    │                               self-pruning-by-end-timestamp idiom
+    │                               as diff::DiffDetector, applied to
+    │                               the identically-shaped problem.
+    │                               filter_new(candidates, tick)
+    │                               processes a whole tick's flip
+    │                               candidates as one batch (mirrors
+    │                               DiffDetector::diff), not per-
+    │                               candidate, then prunes once.
+    │                               NotificationHub: owns a
+    │                               tokio::sync::broadcast::Sender<
+    │                               Arc<str>> (not mpsc — see the
+    │                               crate's module doc comment for why
+    │                               broadcast's never-backpressures-the-
+    │                               sender property is load-bearing
+    │                               here, unlike storage's deliberately
+    │                               backpressuring mpsc). publish(&self,
+    │                               &FlipAlert) -> usize serializes to
+    │                               JSON once into a shared Arc<str>
+    │                               and broadcasts it — non-blocking,
+    │                               &self not &mut self, safe to call
+    │                               from the detection loop directly.
+    │                               bind(addr) and serve(hub, listener)
+    │                               are split so callers/tests can bind
+    │                               to an OS-assigned port and read
+    │                               back the real address before the
+    │                               accept loop starts; serve() spawns
+    │                               one task per connected client
+    │                               (subscribed to the broadcast channel
+    │                               *before* the WebSocket handshake
+    │                               even starts, closing any race
+    │                               window), forwarding alerts via
+    │                               tokio_tungstenite until the client
+    │                               disconnects or the connection
+    │                               errors — one client's failure never
+    │                               affects the accept loop or other
+    │                               clients. 9 unit tests cover the
+    │                               alert payload shape (including that
+    │                               auction_end is NOT serialized),
+    │                               dedup batch/pruning semantics
+    │                               (mirroring DiffDetector's own test
+    │                               suite), publish-with-no-subscribers
+    │                               not erroring, and one real end-to-
+    │                               end test that binds a real socket,
+    │                               connects a real tokio-tungstenite
+    │                               client, publishes, and asserts the
+    │                               client receives the correctly-
+    │                               shaped JSON.
     └── storage/                   DONE: async auction/price storage.
         src/lib.rs                  SnapshotStore::open(db_path) opens
                                    (creates) a SQLite file (rusqlite,
@@ -476,7 +562,7 @@ skyblock-flipper/
                                    history.
 ```
 
-Not yet created: `crates/notify`, `crates/flipper-server`, `web/`.
+Not yet created: `crates/flipper-server`, `web/`.
 
 ## Toolchain notes (read before running cargo update)
 
@@ -494,25 +580,32 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   at ~46,800 auctions each (e.g. `tick=1785736343562 auctions=46840`).
   The "not yet verified" caveat from earlier sessions is resolved.
 - `cargo build --workspace` — passes (debug and `--release`)
-- `cargo test --workspace` — passes (46 run + 2 `#[ignore]`'d
-  benchmarks = 48 tests: 1 common, 6 diff, 5 parser, 11 fingerprint, 7
-  pricing (+1 benchmark), 13 engine (+1 benchmark), 4 storage, 1
-  ingestion wiremock integration, plus doc-tests), on rustc 1.94 (the
-  `url`/`idna` pin from the toolchain notes below was not needed)
+- `cargo test --workspace` — passes (55 run + 2 `#[ignore]`'d
+  benchmarks = 57 tests: 1 common, 6 diff, 5 parser, 11 fingerprint, 7
+  pricing (+1 benchmark), 13 engine (+1 benchmark), 9 notify, 4
+  storage, 1 ingestion wiremock integration, plus doc-tests), on
+  rustc 1.94 (the `url`/`idna` pin from the toolchain notes below was
+  not needed)
 - `cargo clippy --workspace --all-targets` — clean on `parser`,
-  `storage`, `fingerprint`, `pricing`, and `engine`; pre-existing
-  doc-comment lint warnings remain in `ingestion/src/lib.rs` only
-  (unrelated to this session's changes)
-- `ingestion-service`'s channel receiver now runs the full
-  diff → parse → fingerprint → evaluate → price cache update → store
-  pipeline per snapshot (see the `crates/ingestion/src/main.rs` entry
-  above for the exact wiring, the evaluate-before-update ordering
-  requirement, and the "cheapest BIN this tick" placeholder-pricing
-  caveat). Per-snapshot log line reports total/changed/parsed/failed/
-  unique-fingerprint/priced-fingerprint counts, the price cache's
-  total size, flips_found, below_threshold, and the diff detector's
-  live-tracked count. A detected flip additionally logs its own
-  "flip detected" line with the full profit breakdown.
+  `storage`, `fingerprint`, `pricing`, `engine`, `notify`, and
+  `common`; pre-existing doc-comment lint warnings remain in
+  `ingestion/src/lib.rs` only (unrelated to this session's changes)
+- `ingestion-service` now runs the complete pipeline end to end:
+  diff → parse → fingerprint → evaluate → dedup → publish (WebSocket)
+  → price cache update → store, per snapshot. See the
+  `crates/ingestion/src/main.rs` entry above for the exact wiring, the
+  evaluate-before-update ordering requirement, the dedup-before-
+  publish ordering, and the "cheapest BIN this tick" placeholder-
+  pricing caveat (still unaddressed).
+- **Manually smoke-tested**: started `target/release/ingestion-service`
+  with a fake API key — confirmed the WebSocket listener binds and
+  logs "websocket notification server listening" *before* the
+  ingestion loop attempts its first Hypixel request, and that the
+  process still exits cleanly (non-zero, no panic) when that request
+  fails in this network-restricted sandbox. Did not verify an actual
+  end-to-end flip alert against live Hypixel data (no network access
+  here) — the `notify` crate's own integration test covers the
+  publish-to-connected-client path with a real socket instead.
 - `pricing::PriceCache::get` benchmarked at ~55 ns/op over 50,000
   entries; `engine::evaluate` benchmarked at ~2.9 ns/op (excludes the
   cache lookup itself) — both release build, single-threaded. See the
@@ -522,7 +615,9 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   nonsensical "5,000,000 calls in 124ns" — fixed by varying the input
   per iteration through `std::hint::black_box`. Worth remembering if
   a future micro-benchmark in this workspace reports a suspiciously
-  round or tiny number.
+  round or tiny number. `notify` has no dedicated benchmark (its hot-
+  path-adjacent cost is `broadcast::Sender::send`, a tokio primitive,
+  not custom logic worth re-benchmarking).
 - Binary starts, loads config, and fails gracefully (structured error
   log, non-zero exit, no panic) when the network is unreachable
 
@@ -540,29 +635,31 @@ Phase 3-style pass if it's blocking real usage sooner.
 
 ## Immediate next step
 
-**Phase 1.8: flip detection (dedup) + notification hookup.** The
-threshold pass/fail decision already lives in `engine::evaluate`
-(`FlipVerdict::Flip`), so what's left of "flip detection" as a
-distinct step is narrower than the original roadmap wording:
-1. **Dedup across ticks.** Right now `ingestion-service` logs a "flip
-   detected" line every tick an auction both remains listed *and*
-   still evaluates as a flip (an auction usually spans several ticks
-   before it's bought/expires) — there's no tracking of "have we
-   already alerted on this uuid." Needs a bounded seen-set (same shape
-   of problem `diff::DiffDetector` already solved for raw auctions,
-   possibly reusable/adjacent logic) so each auction is reported once,
-   not once per tick it survives.
-2. **Replace the placeholder pricing feed.** `main.rs`'s "cheapest BIN
-   this tick" is still not a real fair-value estimate — worth revisiting
-   once dedup exists, since a real estimate would change which auctions
-   even reach `Flip`.
-3. **WebSocket notification (step 9)** is the actual "send it
-   somewhere" step and is still fully unbuilt — right now a "flip
-   detected" log line is the only output. **New requirement to build
-   in when this happens:** every alert payload must include a
-   clickable/copyable `/viewauction <uuid>` command. Deliberately
-   deferred, not implemented now — the user was explicit this must not
-   touch the hot path. `ParsedItem.uuid` already flows through the
-   whole pipeline unmodified, so this is a `format!()` at
-   notification time and nothing upstream needs to change. See the
-   fuller note on step 9 in the Build order section above.
+**All 9 numbered Phase 1 steps are done.** There isn't a single
+obvious "next numbered step" anymore — the roadmap's Phase 1 list is
+exhausted. Realistic options, none started, no priority order implied
+by their listing here:
+
+1. **Replace the placeholder pricing feed.** `main.rs`'s
+   `estimated_value` is still "cheapest BIN observed this tick,"
+   flagged as a placeholder since Phase 1.6 and never addressed. A
+   real fair-value estimate (e.g. sourced from `storage`'s
+   accumulating price history) would change which auctions even reach
+   `FlipVerdict::Flip`, so this arguably has more real-world impact on
+   flip *accuracy* than anything else left.
+2. **Ingestion latency.** Flagged since Phase 1.6, still real:
+   `detect_latency_ms=238`, `snapshot_fetch_latency_ms=1074` from a
+   live run dwarf the entire rest of the pipeline (fingerprinting is
+   µs-scale, price lookup ~55 ns, evaluate ~2.9 ns). This is the
+   "detecting Hypixel's cache refresh as fast as possible" lever
+   called out as the main competitive edge at the top of this file,
+   and it's the one part of the stack that hasn't been touched since
+   the very first session.
+3. **Phase 2 — Website**, per the Build order section above: live
+   flip feed UI, user-configurable min-profit/min-ROI settings (which
+   `engine::FlipThresholds` and `pricing`'s placeholder feed are
+   already structured to accept once they exist).
+4. **Phase 3 — Optimization**: now that every stage has some latency
+   number (measured or estimated), a real profiling pass against live
+   Hypixel traffic would confirm or correct the budget table above
+   rather than relying on synthetic benchmarks.

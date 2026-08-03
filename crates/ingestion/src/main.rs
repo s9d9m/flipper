@@ -3,8 +3,10 @@ use diff::DiffDetector;
 use engine::{FeeSchedule, FlipThresholds, FlipVerdict};
 use fingerprint::Fingerprint;
 use ingestion::HypixelClient;
+use notify::{FlipAlert, FlipDeduplicator, NotificationHub};
 use pricing::{PriceCache, PriceEntry};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use storage::SnapshotStore;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -27,6 +29,7 @@ async fn main() {
     };
 
     let storage_db_path = config.storage_db_path.clone();
+    let websocket_bind_addr = config.websocket_bind_addr.clone();
 
     let client = match HypixelClient::new(config) {
         Ok(client) => client,
@@ -44,11 +47,21 @@ async fn main() {
         }
     };
 
-    // Shared with nothing else inside this binary yet — the WebSocket
-    // notification stage that will fan out flips is a later, unbuilt
-    // step — but wrapping it in Arc now models how it'll actually be
-    // used once a hot-path reader exists on another task.
-    let price_cache = std::sync::Arc::new(PriceCache::new());
+    let ws_listener = match NotificationHub::bind(&websocket_bind_addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("failed to bind websocket notification server: {err}");
+            std::process::exit(1);
+        }
+    };
+    let notification_hub = Arc::new(NotificationHub::new(256));
+    tokio::spawn(NotificationHub::serve(
+        Arc::clone(&notification_hub),
+        ws_listener,
+    ));
+    info!(addr = %websocket_bind_addr, "websocket notification server listening");
+
+    let price_cache = Arc::new(PriceCache::new());
 
     // Placeholder defaults; claude.md's Phase 2 website already
     // anticipates user-configurable min-profit/min-ROI settings, which
@@ -64,6 +77,7 @@ async fn main() {
 
     let receiver = tokio::spawn(async move {
         let mut detector = DiffDetector::new();
+        let mut dedup = FlipDeduplicator::new();
 
         while let Some(snapshot) = rx.recv().await {
             let tick = snapshot.last_updated;
@@ -94,7 +108,7 @@ async fn main() {
             let mut unique_fingerprints: HashSet<Fingerprint> =
                 HashSet::with_capacity(parsed.len());
             let mut cheapest_bin: HashMap<Fingerprint, PriceEntry> = HashMap::new();
-            let mut flips_found = 0usize;
+            let mut flip_candidates: Vec<FlipAlert> = Vec::new();
             let mut below_threshold = 0usize;
 
             for item in &parsed {
@@ -104,18 +118,15 @@ async fn main() {
                 let cached_price = price_cache.get(fp);
                 match engine::evaluate(item, cached_price, tick, &fee_schedule, &flip_thresholds) {
                     FlipVerdict::Flip(profit) => {
-                        flips_found += 1;
-                        info!(
-                            uuid = %item.uuid,
-                            item = %item.display_name,
-                            buy_price = profit.buy_price,
-                            estimated_value = profit.estimated_value,
-                            tax = profit.tax,
-                            expected_profit = profit.expected_profit,
-                            roi_percent = profit.roi_percent,
-                            sample_size = profit.sample_size,
-                            "flip detected"
-                        );
+                        flip_candidates.push(FlipAlert::new(
+                            item.uuid.clone(),
+                            item.display_name.clone(),
+                            profit.buy_price,
+                            profit.estimated_value,
+                            profit.expected_profit,
+                            profit.roi_percent,
+                            item.end,
+                        ));
                     }
                     FlipVerdict::BelowThreshold(_) => below_threshold += 1,
                     _ => {}
@@ -148,6 +159,26 @@ async fn main() {
             let priced_fingerprint_count = cheapest_bin.len();
             price_cache.update_batch(cheapest_bin);
 
+            // Dedup (sync, in-memory, batched once per tick) then
+            // publish (non-blocking) — see the notify crate's module
+            // docs for why this ordering and these two primitives never
+            // add latency to detection.
+            let new_flips = dedup.filter_new(flip_candidates, tick);
+            let flips_found = new_flips.len();
+            for alert in &new_flips {
+                notification_hub.publish(alert);
+                info!(
+                    uuid = %alert.auction_uuid,
+                    item = %alert.item_name,
+                    buy_price = alert.buy_price,
+                    estimated_value = alert.estimated_value,
+                    profit = alert.profit,
+                    roi_percent = alert.roi_percent,
+                    viewauction = %alert.viewauction_command,
+                    "flip detected"
+                );
+            }
+
             let parsed_count = parsed.len();
             if let Err(err) = store.store(tick, parsed).await {
                 warn!(tick, error = %err, "failed to persist parsed auction batch");
@@ -165,7 +196,8 @@ async fn main() {
                 flips_found,
                 below_threshold,
                 tracked_live = detector.tracked_count(),
-                "diffed, parsed, fingerprinted, evaluated, priced, and stored snapshot"
+                dedup_tracked = dedup.tracked_count(),
+                "diffed, parsed, fingerprinted, evaluated, priced, deduped, notified, and stored snapshot"
             );
         }
     });

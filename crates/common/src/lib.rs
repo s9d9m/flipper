@@ -67,6 +67,9 @@ pub struct Config {
     /// Path to the SQLite database file used for auction/price history
     /// storage (the async, off-hot-path lane — see `storage` crate).
     pub storage_db_path: String,
+    /// Bind address for the WebSocket flip-notification server (see
+    /// `notify` crate).
+    pub websocket_bind_addr: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,12 +115,16 @@ impl Config {
         let storage_db_path =
             env::var("STORAGE_DB_PATH").unwrap_or_else(|_| "auctions.sqlite3".to_string());
 
+        let websocket_bind_addr =
+            env::var("WEBSOCKET_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:9001".to_string());
+
         Ok(Config {
             hypixel_api_key,
             hypixel_base_url,
             tick_poll_interval_ms,
             request_timeout_ms,
             storage_db_path,
+            websocket_bind_addr,
         })
     }
 }

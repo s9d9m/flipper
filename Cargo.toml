@@ -9,6 +9,7 @@ members = [
     "crates/fingerprint",
     "crates/pricing",
     "crates/engine",
+    "crates/notify",
 ]
 
 # Shared release profile: the hot-path crates (parser, pricing, engine — added

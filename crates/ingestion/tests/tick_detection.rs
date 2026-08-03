@@ -14,6 +14,7 @@ fn test_config(base_url: String) -> Config {
         tick_poll_interval_ms: 10,
         request_timeout_ms: 2000,
         storage_db_path: ":memory:".to_string(),
+        websocket_bind_addr: "127.0.0.1:0".to_string(),
     }
 }
 
