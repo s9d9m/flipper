@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/ingestion",
+    "crates/diff",
 ]
 
 # Shared release profile: the hot-path crates (parser, pricing, engine — added

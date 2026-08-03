@@ -111,8 +111,8 @@ hundreds of ms to seconds of pure waste versus active tick-detection.
 **Phase 1 — Core Backend**
 1. Rust project setup ✅ done
 2. Hypixel auction ingestion service ✅ done (see below)
-3. Auction diff detection — **next step, not yet built**
-4. Minimal item parser — not built
+3. Auction diff detection ✅ done (see below)
+4. Minimal item parser — **next step, not yet built**
 5. Item fingerprinting — not built
 6. In-memory price cache — not built
 7. Profit calculation engine — not built
@@ -166,15 +166,35 @@ skyblock-flipper/
         │                          items, price anything, or decide
         │                          what's a flip.
         src/main.rs                 Standalone runnable binary. Channel
-        │                          receiver currently just prints
-        │                          snapshot summaries — Phase 1.3 will
-        │                          replace this with real diff
-        │                          detection.
+        │                          receiver runs each snapshot through
+        │                          diff::DiffDetector and prints only
+        │                          the new/changed auctions — Phase 1.4
+        │                          (parser) will replace this println!
+        │                          with real item parsing.
         tests/tick_detection.rs      Integration test against a local
                                     wiremock mock server — proves
                                     tick-detection + concurrent-fetch +
                                     merge logic without needing live
                                     Hypixel access.
+    └── diff/                     DONE: auction diff detection.
+        src/lib.rs                  DiffDetector: in-memory
+                                   HashMap<uuid, SeenAuction> keyed by
+                                   auction uuid, storing starting_bid +
+                                   end. diff(snapshot) emits only
+                                   auctions that are new or whose
+                                   starting_bid/end changed since last
+                                   seen, then self-prunes any entry
+                                   whose end has passed as of the
+                                   current tick — bounds the set to
+                                   "currently live auctions" with no
+                                   TTL timer, no database, no Redis.
+                                   Synchronous, no tokio dependency.
+                                   6 unit tests cover: first-snapshot
+                                   all-new, unchanged filtered out,
+                                   changed starting_bid re-emitted,
+                                   expired-auction pruning, isolating a
+                                   new auction among unchanged ones,
+                                   and an empty-snapshot no-op.
 ```
 
 Not yet created: `crates/parser`, `crates/pricing`, `crates/engine`,
@@ -192,8 +212,15 @@ the ICU4X crate family, which requires edition2024 (unsupported on
 ## Verified working (as of last session)
 
 - `cargo build --workspace` — passes (debug and `--release`)
-- `cargo test --workspace` — passes, including the wiremock integration
-  test
+- `cargo test --workspace` — passes (9 tests: 1 common, 6 diff, 1
+  ingestion wiremock integration, plus doc-tests), on rustc 1.94 (the
+  `url`/`idna` pin from the toolchain notes below was not needed)
+- `cargo clippy --workspace --all-targets` — clean except pre-existing
+  doc-comment lint warnings in `ingestion/src/lib.rs` (unrelated to
+  diff detection)
+- `ingestion-service` now runs every snapshot through
+  `diff::DiffDetector` before printing, so new/changed auctions are
+  isolated end-to-end from the channel through diff detection
 - Binary starts, loads config, and fails gracefully (structured error
   log, non-zero exit, no panic) when the network is unreachable
 - Not yet verified: a live run against the real Hypixel API (the
@@ -203,11 +230,10 @@ the ICU4X crate family, which requires edition2024 (unsupported on
 
 ## Immediate next step
 
-**Phase 1.3: auction diff detection.** Consumes `AuctionSnapshot` off
-the channel `HypixelClient::run` already produces. Maintains an
-in-memory seen-UUID set (short TTL — a bounded hash set or bloom filter,
-no database, no Redis round-trip) and emits only new/changed auctions
-downstream. This is what keeps every later stage (parser, pricing,
-engine) from redoing work on the ~90% of auctions that are unchanged
-between polls — the single biggest realistic performance win available
-given the fixed ~60s Hypixel cache window.
+**Phase 1.4: minimal item parser.** Consumes the `Vec<RawAuction>`
+`diff::DiffDetector::diff` now emits and decodes `item_bytes`
+(base64 → gzip → NBT) into just the fields that affect price (item ID
+and the handful of modifiers pricing cares about) — not full NBT
+normalization, which is deferred to the async pass per the
+fingerprinting design note above. This is the last stage before
+fingerprinting and pricing can start.

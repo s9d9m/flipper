@@ -28,7 +28,12 @@ fn auction(uuid: &str) -> serde_json::Value {
     })
 }
 
-fn page_response(page: u32, total_pages: u32, last_updated: i64, uuids: &[&str]) -> serde_json::Value {
+fn page_response(
+    page: u32,
+    total_pages: u32,
+    last_updated: i64,
+    uuids: &[&str],
+) -> serde_json::Value {
     json!({
         "success": true,
         "page": page,
@@ -52,7 +57,12 @@ async fn detects_new_tick_and_assembles_full_snapshot() {
     Mock::given(method("GET"))
         .and(path("/skyblock/auctions"))
         .and(query_param("page", "0"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(page_response(0, 2, 1_000, &["stale-a"])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page_response(
+            0,
+            2,
+            1_000,
+            &["stale-a"],
+        )))
         .up_to_n_times(2)
         .mount(&server)
         .await;
@@ -60,14 +70,24 @@ async fn detects_new_tick_and_assembles_full_snapshot() {
     Mock::given(method("GET"))
         .and(path("/skyblock/auctions"))
         .and(query_param("page", "0"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(page_response(0, 2, 2_000, &["fresh-a"])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page_response(
+            0,
+            2,
+            2_000,
+            &["fresh-a"],
+        )))
         .mount(&server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/skyblock/auctions"))
         .and(query_param("page", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(page_response(1, 2, 2_000, &["fresh-b"])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page_response(
+            1,
+            2,
+            2_000,
+            &["fresh-b"],
+        )))
         .mount(&server)
         .await;
 
