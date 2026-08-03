@@ -122,8 +122,8 @@ hundreds of ms to seconds of pure waste versus active tick-detection.
    cache") but pulling it forward doesn't block anything else and gives
    a place to accumulate price history immediately.
 5. Item fingerprinting ✅ done (see below)
-6. In-memory price cache — **next step, not yet built**
-7. Profit calculation engine — not built
+6. In-memory price cache ✅ done (see below)
+7. Profit calculation engine — **next step, not yet built**
 8. Flip detection — not built
 9. WebSocket notification server — not built
 
@@ -183,18 +183,28 @@ skyblock-flipper/
         │                          (parse failures are logged and
         │                          skipped, not fatal), then
         │                          fingerprint::fingerprint on every
-        │                          parsed item (collected into a
-        │                          HashSet purely to log how many
-        │                          unique fingerprints this batch
-        │                          collapsed to — not consumed by
-        │                          anything downstream yet, since the
-        │                          price cache doesn't exist), then
-        │                          hands the parsed batch to storage::
-        │                          SnapshotStore::store(tick, items).
-        │                          Logs total/changed/parsed/failed/
-        │                          unique-fingerprint counts and the
-        │                          diff detector's live-tracked count
-        │                          per snapshot.
+        │                          parsed item. For BIN auctions, groups
+        │                          by fingerprint and keeps the
+        │                          cheapest starting_bid observed this
+        │                          tick + a sample count, feeding that
+        │                          into a pricing::PriceCache (built
+        │                          once, held in an Arc, not yet read
+        │                          by anything else in this binary —
+        │                          the flip detector/profit calculator
+        │                          that will read it are later, unbuilt
+        │                          steps) via update_batch(). NOTE:
+        │                          "cheapest BIN this tick" is a
+        │                          placeholder value source, not a real
+        │                          fair-value estimate — that's the
+        │                          profit-calculation engine's job.
+        │                          Then hands the parsed batch to
+        │                          storage::SnapshotStore::store(tick,
+        │                          items). Logs total/changed/parsed/
+        │                          failed/unique-fingerprint/priced-
+        │                          fingerprint counts, the price
+        │                          cache's total size, and the diff
+        │                          detector's live-tracked count per
+        │                          snapshot.
         tests/tick_detection.rs      Integration test against a local
                                     wiremock mock server — proves
                                     tick-detection + concurrent-fetch +
@@ -296,6 +306,52 @@ skyblock-flipper/
     │                               hash, None-vs-empty-string not
     │                               colliding, and hash independence
     │                               from HashMap insertion order.
+    ├── pricing/                    DONE: in-memory price cache.
+    │   src/lib.rs                   PriceCache: SHARD_COUNT=64
+    │                               independent ArcSwap<HashMap<
+    │                               Fingerprint, PriceEntry,
+    │                               FingerprintHasher>> shards (the
+    │                               arc-swap crate's RCU/atomic-swap
+    │                               pattern named in the architecture
+    │                               decisions above). Shard index is
+    │                               fingerprint.0 & (SHARD_COUNT - 1).
+    │                               get(fingerprint) is wait-free: one
+    │                               atomic load + a hashmap probe using
+    │                               FingerprintHasher (an identity
+    │                               hasher — Fingerprint is already a
+    │                               well-distributed u64, so this skips
+    │                               a redundant SipHash pass), no
+    │                               allocation, no locking, never
+    │                               blocked by a concurrent writer.
+    │                               Missing entries return None rather
+    │                               than panicking or blocking.
+    │                               update_batch(...) groups updates by
+    │                               shard, then does one .rcu() per
+    │                               touched shard (clone-on-write +
+    │                               compare-and-swap retry, so
+    │                               concurrent writers to the same
+    │                               shard never lose an update to a
+    │                               race, and never block a concurrent
+    │                               get()). PriceEntry is a fixed-size
+    │                               Copy struct: estimated_value (u64
+    │                               coins), sample_size (u32),
+    │                               updated_at_tick (i64) — what
+    │                               estimated_value means (median?
+    │                               trimmed mean?) is deliberately left
+    │                               to the caller/profit engine, not
+    │                               this crate. 7 unit tests (empty
+    │                               cache, insert/read, overwrite,
+    │                               500 entries across shards, empty
+    │                               batch no-op, concurrent same-shard
+    │                               writers not losing data, reads not
+    │                               blocking a concurrent writer) plus
+    │                               one #[ignore]'d benchmark
+    │                               (`cargo test -p pricing --release
+    │                               -- --ignored --nocapture`) —
+    │                               measured ~55 ns/op for get() over
+    │                               50,000 entries on the machine this
+    │                               was built on, well inside the <1 µs
+    │                               budget line below.
     └── storage/                   DONE: async auction/price storage.
         src/lib.rs                  SnapshotStore::open(db_path) opens
                                    (creates) a SQLite file (rusqlite,
@@ -325,8 +381,8 @@ skyblock-flipper/
                                    history.
 ```
 
-Not yet created: `crates/pricing` (the in-memory price cache),
-`crates/engine`, `crates/notify`, `crates/flipper-server`, `web/`.
+Not yet created: `crates/engine` (profit calculation + flip detection),
+`crates/notify`, `crates/flipper-server`, `web/`.
 
 ## Toolchain notes (read before running cargo update)
 
@@ -344,38 +400,52 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   at ~46,800 auctions each (e.g. `tick=1785736343562 auctions=46840`).
   The "not yet verified" caveat from earlier sessions is resolved.
 - `cargo build --workspace` — passes (debug and `--release`)
-- `cargo test --workspace` — passes (28 tests: 1 common, 6 diff, 5
-  parser, 11 fingerprint, 4 storage, 1 ingestion wiremock integration,
-  plus doc-tests), on rustc 1.94 (the `url`/`idna` pin from the
-  toolchain notes below was not needed)
+- `cargo test --workspace` — passes (35 tests: 1 common, 6 diff, 5
+  parser, 11 fingerprint, 7 pricing (+1 `#[ignore]`'d benchmark), 4
+  storage, 1 ingestion wiremock integration, plus doc-tests), on
+  rustc 1.94 (the `url`/`idna` pin from the toolchain notes below was
+  not needed)
 - `cargo clippy --workspace --all-targets` — clean on `parser`,
-  `storage`, and `fingerprint`; pre-existing doc-comment lint warnings
-  remain in `ingestion/src/lib.rs` only (unrelated to this session's
-  changes)
+  `storage`, `fingerprint`, and `pricing`; pre-existing doc-comment
+  lint warnings remain in `ingestion/src/lib.rs` only (unrelated to
+  this session's changes)
 - `ingestion-service`'s channel receiver now runs the full
-  diff → parse → fingerprint → store pipeline per snapshot:
-  `diff::DiffDetector` isolates new/changed auctions,
-  `parser::parse_item` decodes each one's NBT (parse failures are
-  logged and skipped, not fatal), `fingerprint::fingerprint` computes
-  each parsed item's price-identity key (collected into a `HashSet`
-  purely to log the unique-fingerprint count for this batch — nothing
-  consumes it yet), and `storage::SnapshotStore` persists the parsed
-  batch to SQLite. Per-snapshot log line reports total/changed/parsed/
-  failed/unique-fingerprint counts plus the diff detector's live-
-  tracked count.
+  diff → parse → fingerprint → price cache → store pipeline per
+  snapshot (see the `crates/ingestion/src/main.rs` entry above for the
+  exact wiring and the "cheapest BIN this tick" placeholder-pricing
+  caveat). Per-snapshot log line reports total/changed/parsed/failed/
+  unique-fingerprint/priced-fingerprint counts, the price cache's
+  total size, and the diff detector's live-tracked count.
+- `pricing::PriceCache::get` benchmarked at ~55 ns/op over 50,000
+  entries (release build, single-threaded) — see the pricing crate
+  entry above for how to reproduce.
 - Binary starts, loads config, and fails gracefully (structured error
   log, non-zero exit, no panic) when the network is unreachable
 
+## Flagged for a future pass (not yet acted on)
+
+The user pointed out, correctly, that the biggest speed win left on
+the table is not in this compute pipeline — it's ingestion's tick
+detection and fetch latency. Real numbers from a live run:
+`detect_latency_ms=238`, `snapshot_fetch_latency_ms=1074`. Both dwarf
+anything downstream (fingerprinting is µs-scale, price lookup is now
+measured at ~55 ns). This wasn't addressed in Phase 1.6 since it
+wasn't in scope for the cache, but it's the natural next lever once
+the core pipeline (steps 7-9) is complete, or worth an early
+Phase 3-style pass if it's blocking real usage sooner.
+
 ## Immediate next step
 
-**Phase 1.6: in-memory price cache.** Keyed on `fingerprint::
-Fingerprint`, sharded, updated by a background task, read lock-free
-(RCU/atomic-swap style) per the architecture decisions above — the
-hot path never blocks on a cache miss, it skips and lets the
-background system price that fingerprint for next time. Feeds off the
-same parsed+fingerprinted stream `ingestion-service` already produces
-per snapshot (today that stream only goes to storage; the cache needs
-to observe it too, probably by computing a per-fingerprint running
-price estimate from `storage`'s accumulating history, or from the live
-stream directly — worth deciding which before writing code). This is
-what the profit calculation engine (step 7) will read from.
+**Phase 1.7: profit calculation engine.** Reads a fingerprinted
+auction's asking price (from the parsed/fingerprinted stream
+`ingestion-service` already produces per snapshot) and looks it up in
+`pricing::PriceCache::get`. On a cache hit, computes profit/ROI
+(estimated_value minus asking price, minus AH tax); on a cache miss,
+skips fast per the "missing prices fail fast and safely" rule already
+implemented in `PriceCache::get` (returns `None`, no fallback, no
+blocking). This is also the natural point to replace `main.rs`'s
+placeholder "cheapest BIN this tick" pricing with something that
+deserves the name "profit calculation" — e.g. a real fair-value
+estimate sourced from `storage`'s accumulating price history, not just
+this tick's cheapest listing. What the engine's output feeds (flip
+detection, step 8) is not yet built either.

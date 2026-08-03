@@ -1,7 +1,9 @@
 use common::{AuctionSnapshot, Config};
 use diff::DiffDetector;
+use fingerprint::Fingerprint;
 use ingestion::HypixelClient;
-use std::collections::HashSet;
+use pricing::{PriceCache, PriceEntry};
+use std::collections::{HashMap, HashSet};
 use storage::SnapshotStore;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -41,6 +43,12 @@ async fn main() {
         }
     };
 
+    // Shared with nothing yet inside this binary — the flip detector and
+    // profit calculator that will read from it are later, unbuilt steps
+    // — but wrapping it in Arc now models how it'll actually be used
+    // once a hot-path reader exists on another task.
+    let price_cache = std::sync::Arc::new(PriceCache::new());
+
     // Bounded channel: backpressure here is a deliberate signal that
     // downstream processing (diff detection, in Phase 1.3) isn't keeping
     // up — better to surface that loudly than to buffer unboundedly.
@@ -66,16 +74,42 @@ async fn main() {
                 }
             }
 
-            // Fingerprinting stage: not consumed by anything yet (the RAM
-            // price cache is the next unbuilt step), but computing it here
-            // keeps the pipeline shape matching the architecture diagram
-            // and gives an early, cheap signal of how much duplicate-item
-            // collapsing the price cache will get to do once it exists.
-            let unique_fingerprints: HashSet<_> =
-                parsed.iter().map(fingerprint::fingerprint).collect();
+            // Fingerprinting + price cache feed. NOTE: `estimated_value`
+            // here is just this tick's cheapest observed BIN listing per
+            // fingerprint — a placeholder cheap enough to compute inline,
+            // not a real fair-value estimate (median, outlier-trimmed,
+            // etc.). That's the profit-calculation engine's job (a later,
+            // unbuilt step); this cache only stores/serves whatever value
+            // it's given.
+            let mut unique_fingerprints: HashSet<Fingerprint> =
+                HashSet::with_capacity(parsed.len());
+            let mut cheapest_bin: HashMap<Fingerprint, PriceEntry> = HashMap::new();
+
+            for item in &parsed {
+                let fp = fingerprint::fingerprint(item);
+                unique_fingerprints.insert(fp);
+
+                if item.bin {
+                    cheapest_bin
+                        .entry(fp)
+                        .and_modify(|existing| {
+                            existing.sample_size += 1;
+                            existing.estimated_value =
+                                existing.estimated_value.min(item.starting_bid);
+                        })
+                        .or_insert(PriceEntry {
+                            estimated_value: item.starting_bid,
+                            sample_size: 1,
+                            updated_at_tick: tick,
+                        });
+                }
+            }
+
+            let unique_fingerprint_count = unique_fingerprints.len();
+            let priced_fingerprint_count = cheapest_bin.len();
+            price_cache.update_batch(cheapest_bin);
 
             let parsed_count = parsed.len();
-            let unique_fingerprint_count = unique_fingerprints.len();
             if let Err(err) = store.store(tick, parsed).await {
                 warn!(tick, error = %err, "failed to persist parsed auction batch");
             }
@@ -87,8 +121,10 @@ async fn main() {
                 parsed_auctions = parsed_count,
                 parse_failures,
                 unique_fingerprints = unique_fingerprint_count,
+                priced_fingerprints = priced_fingerprint_count,
+                price_cache_size = price_cache.len(),
                 tracked_live = detector.tracked_count(),
-                "diffed, parsed, fingerprinted, and stored snapshot"
+                "diffed, parsed, fingerprinted, priced, and stored snapshot"
             );
         }
     });
