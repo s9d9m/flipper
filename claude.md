@@ -816,48 +816,54 @@ skyblock-flipper/
     │                               types only — NOT PriceCache; this
     │                               crate still doesn't depend on the
     │                               fingerprint crate at all).
-    │                               Before the profit math, two new
-    │                               tier-aware gates run (only for
-    │                               PriceTier::MajorModifiers/BaseItem —
-    │                               PriceTier::Exact skips both and only
-    │                               ever faces the flat min_sample_size
-    │                               gate, since an exact fingerprint match
-    │                               is already the most trustworthy signal
-    │                               available): (1) a minimum-confidence
-    │                               gate — entry.confidence() must be >=
+    │                               Before the profit math, two gates run,
+    │                               keyed on (tier, source) — not tier
+    │                               alone, as of the confidence-protection
+    │                               session (see below): (1) a minimum-
+    │                               confidence gate — entry.confidence()
+    │                               must be >=
     │                               thresholds.min_major_modifier_confidence
     │                               (default Confidence::Medium, i.e.
-    │                               sample_size >= 10) for Tier 2, or >=
+    │                               sample_size >= 10) for Tier 2, >=
     │                               thresholds.min_base_item_confidence
     │                               (default Confidence::High, i.e.
-    │                               sample_size >= 50) for Tier 3 —
-    │                               otherwise FlipVerdict::
-    │                               InsufficientSampleSize, the same
-    │                               variant the flat min_sample_size gate
-    │                               already used; (2) an ROI multiplier —
-    │                               the computed roi_percent must clear
-    │                               min_roi_percent *
+    │                               sample_size >= 50) for Tier 3, or >=
+    │                               thresholds.min_live_exact_confidence
+    │                               (default Confidence::Medium) for
+    │                               (Tier 1, PriceSource::Live) — otherwise
+    │                               FlipVerdict::InsufficientSampleSize;
+    │                               (Tier 1, PriceSource::Historical) is
+    │                               the only case with no floor at all;
+    │                               (2) an ROI multiplier — roi_percent
+    │                               must clear min_roi_percent *
     │                               thresholds.major_modifier_roi_multiplier
-    │                               (default 1.5) for Tier 2, or *
-    │                               thresholds.base_item_roi_multiplier
-    │                               (default 3.0) for Tier 3, vs. the flat
-    │                               min_roi_percent for Tier 1 — while
-    │                               min_profit is deliberately left
-    │                               unmultiplied at every tier, since it's
-    │                               what makes a flip worth clicking at
-    │                               all ("coins/hour"), not a data-quality
-    │                               signal. Net effect: Tier 3 only ever
-    │                               reports "obviously" underpriced
-    │                               auctions with deep sample support,
-    │                               matching the task's own phrasing,
-    │                               while Tier 2 stays useful for the
-    │                               "many consistent 1-10m flips" goal
-    │                               without being priced out entirely.
-    │                               ProfitCalculation gained a `tier:
-    │                               PriceTier` field so downstream
-    │                               consumers (logging, notifications)
-    │                               can see how a reported flip's price
-    │                               was derived.
+    │                               (1.5) for Tier 2, * base_item_roi_
+    │                               multiplier (3.0) for Tier 3, *
+    │                               live_exact_roi_multiplier (1.2) for
+    │                               (Tier 1, Live), or the flat
+    │                               min_roi_percent for (Tier 1,
+    │                               Historical) only — while min_profit is
+    │                               deliberately left unmultiplied
+    │                               everywhere, since it's what makes a
+    │                               flip worth clicking at all
+    │                               ("coins/hour"), not a data-quality
+    │                               signal. The 1.2 value for Live-Exact
+    │                               is deliberately less than Tier 2's 1.5:
+    │                               an exact fingerprint match is still a
+    │                               strictly more precise item-identity
+    │                               match than Major regardless of source,
+    │                               so it earns a lighter margin once
+    │                               past its own confidence floor —
+    │                               preserving a meaningful ordering
+    │                               (Historical-Exact 1.0x < Live-Exact-
+    │                               confident 1.2x < Major 1.5x < Base
+    │                               3.0x) rather than letting Live-Exact
+    │                               collapse to the same number as Major
+    │                               by coincidence. ProfitCalculation
+    │                               gained a `tier: PriceTier` field so
+    │                               downstream consumers (logging,
+    │                               notifications) can see how a reported
+    │                               flip's price was derived.
     │                               Profit formula: tax =
     │                               max(estimated_value * tax_rate,
     │                               minimum_tax); expected_profit =
@@ -893,30 +899,51 @@ skyblock-flipper/
     │                               plausible-ROI ceiling (an
     │                               implausibly good "flip" is treated
     │                               as more likely bad cache data than
-    │                               a real opportunity). 26 unit tests
-    │                               (13 original + 5 staleness + 8 new in
-    │                               the tiered-pricing session: Tier 1
-    │                               trusted at low confidence,
-    │                               Tier 2/Tier 3 rejected below their
-    │                               confidence floor and passing at/above
-    │                               it, Tier 2/Tier 3 needing a bigger ROI
-    │                               margin than Tier 1, and
-    │                               ProfitCalculation reporting the right
-    │                               tier) cover every FlipVerdict variant,
+    │                               a real opportunity). 30 unit tests
+    │                               (13 original + 5 staleness + 8 from
+    │                               the tiered-pricing session + 4 new in
+    │                               the confidence-protection session:
+    │                               Historical-Exact still trusted at low
+    │                               confidence — the regression guard for
+    │                               "keep COFL highest trust" — Live-Exact
+    │                               rejected below Medium confidence and
+    │                               passing at/above it, Live-Exact
+    │                               needing a bigger ROI margin than
+    │                               Historical-Exact, and Live-Exact
+    │                               needing a *smaller* ROI margin than
+    │                               Major — proving "keep exact
+    │                               fingerprint priority" still holds
+    │                               under the new source-aware gating; 2
+    │                               pre-existing tests renamed/replaced,
+    │                               ~10 more had their PriceLookup's
+    │                               sample_size bumped from 5 to 20 in
+    │                               their fixtures so they keep testing
+    │                               what they originally tested — e.g.
+    │                               staleness, zero-price, plausibility —
+    │                               rather than getting short-circuited
+    │                               by the new Live-Exact confidence
+    │                               floor before reaching the logic under
+    │                               test) cover every FlipVerdict variant,
     │                               overflow/panic safety at extreme
     │                               values, and a hand-computed profit/
     │                               tax/ROI example. One #[ignore]'d
     │                               benchmark (`cargo test -p engine
     │                               --release -- --ignored --nocapture`)
-    │                               measured ~3.8 ns/op for evaluate()
-    │                               post-tiering (was ~2.9 ns/op
-    │                               pre-tiering — the confidence/
-    │                               multiplier logic added negligible
-    │                               overhead) — note this doesn't include
-    │                               the cache lookup itself (~73 ns for a
-    │                               Tier-1 hit, measured separately in
-    │                               pricing), since evaluate() takes an
-    │                               already-resolved price.
+    │                               measured ~23 ns/op for evaluate()
+    │                               post-confidence-protection (was ~3.8
+    │                               ns/op pre-session — a real, repeatable
+    │                               increase, not noise, from the extra
+    │                               (tier, source) tuple matches; still
+    │                               ~40x under the "<1 µs" profit-
+    │                               calculation budget in the latency
+    │                               table below, and evaluate() remains
+    │                               dwarfed by every other pipeline stage)
+    │                               — note this doesn't include the cache
+    │                               lookup itself (~70-110 ns for a Tier-1
+    │                               hit across this session's runs,
+    │                               measured separately in pricing),
+    │                               since evaluate() takes an already-
+    │                               resolved price.
     │                               **CONFIRMED BUG FIXED (COFL
     │                               session):** `tick`/`updated_at_tick`
     │                               are raw Hypixel epoch-millis, not a
@@ -1275,11 +1302,14 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   backfill against live data — the `notify` and `cofl` crates' own
   integration tests cover their respective paths with a real socket /
   wiremock server instead.
-- `pricing::PriceCache::get` benchmarked at ~73 ns/op for a Tier-1 hit
-  over 50,000 entries (~311 ns/op worst case, a miss at all three
-  tiers — tiered pricing session); `engine::evaluate` benchmarked at
-  ~3.8 ns/op post-tiering (excludes the cache lookup itself) — both
-  release build, single-threaded. See the respective crate entries
+- `pricing::PriceCache::get` benchmarked at ~70-110 ns/op for a Tier-1
+  hit over 50,000 entries across this workspace's sessions (~311-380
+  ns/op worst case, a miss at all three tiers); `engine::evaluate`
+  benchmarked at ~23 ns/op post-confidence-protection (was ~3.8 ns/op
+  before that session — see "Confidence-protection session" above for
+  why the increase is real, not noise, and still negligible in
+  context) — both exclude the cache lookup itself, both release build,
+  single-threaded. See the respective crate entries
   above for how to reproduce. Note: an
   earlier version of the engine benchmark used fixed inputs every
   iteration and LLVM constant-folded the whole loop, reporting a
@@ -1366,6 +1396,23 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   `git diff` on the function bodies), so this is read as this sandbox's
   shared-CPU noise, not a real regression; worth a clean re-benchmark
   on dedicated hardware if the gap needs to be nailed down precisely.
+- (confidence-protection session) `cargo fmt --all` (no changes
+  needed), `cargo test --workspace` (111 tests — `engine` grew from 26
+  to 30 unit tests, see its entry above; every other crate's count
+  unchanged), `cargo clippy --workspace --all-targets` (clean except
+  the same pre-existing `ingestion/src/lib.rs` warnings), and
+  `cargo build --release` all pass after adding the `(tier, source)`-
+  keyed confidence gate and ROI multiplier to `engine::evaluate`. Also
+  re-ran the release binary smoke test (`HYPIXEL_API_KEY=test-key-not-
+  real COFL_BACKFILL_ENABLED=false ./target/release/ingestion-service`)
+  — still starts, binds, and fails gracefully on the expected network
+  restriction. `engine::evaluate` re-benchmarked at ~23 ns/op,
+  confirmed via three repeated runs to be a real, repeatable increase
+  from the ~3.8 ns/op tiered-pricing-session baseline (not noise, in
+  contrast to `pricing::PriceCache::get`'s variance in the market-
+  model session above) — see "Confidence-protection session" below for
+  why this is still negligible relative to the pipeline's real
+  bottlenecks.
 
 ## Price coverage investigation (price coverage session)
 
@@ -1516,6 +1563,58 @@ volatility, and whether `diag_live_merged_total` /
 `cache_average_sample_size` / `cache_high_confidence_entries` actually
 show the cache building real multi-tick evidence over a live run's
 lifetime rather than staying dominated by single-observation entries.
+
+## Confidence-protection session: Live-Exact was source-blind
+
+Live user test data (after the market-model session's aggregation
+fix): processing stayed fast (~50ms/50k auctions), merging worked (302
+live merges, ~6 avg sample size, 20k+ cached entries), but flips were
+still dominated by `tier Exact / Live` — e.g. "FLIP Snowy Gillsplash
+Gloves | buy 67M -> value 78.9M | Exact / Live". Root cause, confirmed
+directly against `engine::evaluate`'s source: the confidence gate and
+ROI multiplier were keyed on `tier` alone —
+`PriceTier::Exact => None` unconditionally, meaning *any*
+`(PriceTier::Exact, PriceSource::Live)` entry was trusted with no
+confidence floor and the unmultiplied `1.0x` ROI bar, identical
+treatment to a COFL `Historical` median built from real completed
+sales. Tier 2/3 already had confidence floors specifically *because*
+they're coarser matches; Tier 1 never got the analogous protection
+against a *thin-sample* match, because "exact fingerprint" was
+conflated with "trustworthy price."
+
+**Fixed**: `FlipThresholds` gained `min_live_exact_confidence`
+(default `Confidence::Medium`, 10+ samples) and
+`live_exact_roi_multiplier` (default `1.2x`), applied only to
+`(PriceTier::Exact, PriceSource::Live)` — both gates now key on
+`(tier, source)`, not `tier` alone (see the `engine` entry above for
+the exact match arms and the reasoning behind `1.2` specifically:
+smaller than Tier 2's `1.5x` since an exact match is still more
+precise than a coarser one regardless of source, preserving a
+meaningful trust ordering rather than letting Live-Exact collapse to
+Major's number by coincidence). `(PriceTier::Exact,
+PriceSource::Historical)` is completely unaffected — no floor, `1.0x`
+multiplier, exactly as before — verified by a new dedicated regression
+test (`historical_exact_tier_is_trusted_even_at_low_confidence`) so
+"keep COFL historical pricing highest trust" isn't just a comment, it's
+enforced by the test suite. Tier 2/3 are untouched regardless of
+source; this is scoped exactly to the gap the live data demonstrated.
+
+**Expected impact**: given the reported ~6 average sample size across
+the cache (below the new floor of 10), a meaningful share of
+Exact/Live flips should now be rejected as `InsufficientSampleSize`
+until accumulation (market-model session) has had more ticks to build
+real evidence. COFL flips and Tier 2/3 Live flips are unaffected.
+`engine::evaluate`'s own benchmark moved from ~3.8 ns/op to ~23 ns/op —
+a real, repeatable cost from the extra `(tier, source)` matching, but
+still ~40x under the "<1 µs" profit-calculation budget and nowhere
+close to `PriceCache::get()`'s ~70-110 ns or any I/O-bound stage.
+
+**Not yet observed against live data**: whether `Confidence::Medium`
+(10) and `1.2x` are well-calibrated, or whether Exact/Live flip volume
+drops more (or less) than expected once real accumulation has had time
+to run. Worth checking `diag_insufficient_sample_total`'s growth rate
+and the `tier Exact / Live` share of reported flips on the next live
+run.
 
 ## Flagged for a future pass (not yet acted on)
 
@@ -1723,12 +1822,12 @@ order:
 1. **Ingestion latency.** Flagged since Phase 1.6, still real:
    `detect_latency_ms=238`, `snapshot_fetch_latency_ms=1074` from a
    live run dwarf the entire rest of the pipeline (fingerprinting is
-   µs-scale, price lookup ~73 ns for a Tier-1 hit / ~311 ns worst case
-   across all three tiers, evaluate ~3.8 ns). This is the "detecting
-   Hypixel's cache refresh as fast as possible" lever called out as
-   the main competitive edge at the top of this file, and it's the one
-   part of the stack that hasn't been touched since the very first
-   session.
+   µs-scale, price lookup ~70-110 ns for a Tier-1 hit / ~311-380 ns
+   worst case across all three tiers, evaluate ~23 ns). This is the
+   "detecting Hypixel's cache refresh as fast as possible" lever called
+   out as the main competitive edge at the top of this file, and it's
+   the one part of the stack that hasn't been touched since the very
+   first session.
 2. **Phase 2 — Website**, per the Build order section above: live
    flip feed UI, user-configurable min-profit/min-ROI settings (which
    `engine::FlipThresholds` and `pricing`'s placeholder feed are

@@ -18,19 +18,43 @@
 //! `pricing::PriceCache::get` returns a [`pricing::PriceLookup`] that
 //! carries both the [`pricing::PriceEntry`] and which tier it came from
 //! (`Exact`, `MajorModifiers`, or `BaseItem`). Exact fingerprint matches
-//! are the most trustworthy signal available (same item, same reforge,
-//! same stars, same enchants, same everything), so they're evaluated
-//! against the plain configured thresholds. The two fallback tiers are
-//! coarser estimates by construction — `MajorModifiers` ignores gems and
-//! minor enchants, `BaseItem` ignores every modifier including stars and
-//! reforges — so `evaluate()` compensates two ways: it requires a higher
-//! minimum confidence (sample size) before trusting either fallback tier
-//! at all, and it multiplies the ROI bar those tiers must clear, so a
+//! (same item, same reforge, same stars, same enchants, same
+//! everything) are the most trustworthy signal available *when the
+//! price behind them is itself trustworthy* — see the confidence-
+//! protection session note below for why that's not the same as "no
+//! checks at all." The two fallback tiers are coarser estimates by
+//! construction — `MajorModifiers` ignores gems and minor enchants,
+//! `BaseItem` ignores every modifier including stars and reforges — so
+//! `evaluate()` compensates two ways: it requires a higher minimum
+//! confidence (sample size) before trusting either fallback tier at
+//! all, and it multiplies the ROI bar those tiers must clear, so a
 //! coarse price still has to look *obviously* underpriced, not just
 //! nominally profitable, before it's reported. This is what keeps Tier 3
 //! ("base item only") limited to the "obvious underpriced opportunities"
 //! the task description asks for, without shutting Tier 2/3 out of the
 //! "many consistent flips" goal entirely.
+//!
+//! # Exact tier is not source-blind (confidence-protection session)
+//!
+//! An exact fingerprint match answers "is this the same item" with
+//! total confidence — it says nothing about whether the *price*
+//! attached to it is trustworthy. A live sighting reflects one or a
+//! few sellers' current asking prices; a `pricing::PriceSource::
+//! Historical` (COFL) entry reflects a median of actual completed
+//! sales. Live-sourced Tier‑1 entries used to get exactly the same
+//! treatment as Historical ones (no confidence floor, no ROI
+//! multiplier) purely because they matched at Tier 1 — a live run
+//! confirmed this in practice: flips dominated by `tier Exact / Live`
+//! backed by cache entries with an average `sample_size` of ~6, well
+//! below what the *coarser* tiers already require.
+//!
+//! `min_live_exact_confidence` and `live_exact_roi_multiplier` close
+//! that gap *only* for `(PriceTier::Exact, PriceSource::Live)`.
+//! `(PriceTier::Exact, PriceSource::Historical)` gets neither — no
+//! floor, `1.0x` multiplier, unchanged — preserving "COFL historical
+//! pricing highest trust" literally, not just in spirit. Tier 2/3 are
+//! untouched regardless of source; this is scoped to the exact gap a
+//! live run demonstrated, not a general threshold rewrite.
 //!
 //! # Ordering requirement on the caller
 //!
@@ -160,6 +184,20 @@ pub struct FlipThresholds {
     /// discriminating signal available, so it needs the deepest sample
     /// before it's trusted for real money.
     pub min_base_item_confidence: Confidence,
+    /// (confidence-protection session) Minimum confidence a
+    /// `(PriceTier::Exact, PriceSource::Live)` price must have before
+    /// it's trusted at all. Does **not** apply to
+    /// `(PriceTier::Exact, PriceSource::Historical)` — COFL medians
+    /// stay unconditionally trusted, as before. See the module doc
+    /// comment for why an exact fingerprint match alone doesn't imply
+    /// a trustworthy *price*.
+    pub min_live_exact_confidence: Confidence,
+    /// Multiplier applied to `min_roi_percent` when the price is
+    /// `(PriceTier::Exact, PriceSource::Live)` and has cleared
+    /// `min_live_exact_confidence`. `1.0` (no multiplier) for
+    /// `(PriceTier::Exact, PriceSource::Historical)`, exactly as
+    /// before.
+    pub live_exact_roi_multiplier: f64,
 }
 
 impl Default for FlipThresholds {
@@ -189,6 +227,21 @@ impl Default for FlipThresholds {
             base_item_roi_multiplier: 3.0,
             min_major_modifier_confidence: Confidence::Medium,
             min_base_item_confidence: Confidence::High,
+            // Same floor as Tier 2 (10+ accumulated samples): a Live
+            // Exact match is precise about *which* item, but a live ask
+            // needs the same evidence bar as a coarser-but-still-Live
+            // signal before it's trusted for real money.
+            min_live_exact_confidence: Confidence::Medium,
+            // Deliberately smaller than major_modifier_roi_multiplier
+            // (1.5): a Live-Exact match that has cleared its confidence
+            // floor is still a strictly more precise item-identity
+            // match than Major (which ignores gems/minor enchants
+            // regardless of source), so it earns a lighter margin --
+            // but not 1.0, since it's still an ask-price signal, not a
+            // sold-price one. Keeps a meaningful ordering: Historical-
+            // Exact (1.0x) < Live-Exact-confident (1.2x) < Major (1.5x)
+            // < Base (3.0x).
+            live_exact_roi_multiplier: 1.2,
         }
     }
 }
@@ -234,9 +287,12 @@ pub enum FlipVerdict {
     /// Cached price exists but is older than `max_price_age_ticks`.
     StalePrice { age_ticks: i64 },
     /// Cached price exists but is built from too few observations to
-    /// trust — either below `min_sample_size` outright, or below the
+    /// trust — either below `min_sample_size` outright, below the
     /// tier-specific confidence floor (`min_major_modifier_confidence` /
-    /// `min_base_item_confidence`) for a Tier 2/3 fallback price.
+    /// `min_base_item_confidence`) for a Tier 2/3 fallback price, or
+    /// below `min_live_exact_confidence` for a
+    /// `(PriceTier::Exact, PriceSource::Live)` price (confidence-
+    /// protection session).
     InsufficientSampleSize { sample_size: u32 },
     /// `starting_bid` or `estimated_value` was zero — no meaningful
     /// ratio can be computed.
@@ -280,10 +336,16 @@ pub fn evaluate(
         };
     }
 
-    let min_tier_confidence = match tier {
-        PriceTier::Exact => None,
-        PriceTier::MajorModifiers => Some(thresholds.min_major_modifier_confidence),
-        PriceTier::BaseItem => Some(thresholds.min_base_item_confidence),
+    // (confidence-protection session) Keyed on (tier, source), not tier
+    // alone: an exact fingerprint match says "same item," not "trusted
+    // price" -- a Live sighting and a Historical (COFL) median carry
+    // different evidence even at identical tiers. See the module doc
+    // comment.
+    let min_tier_confidence = match (tier, entry.source) {
+        (PriceTier::Exact, PriceSource::Live) => Some(thresholds.min_live_exact_confidence),
+        (PriceTier::Exact, PriceSource::Historical) => None,
+        (PriceTier::MajorModifiers, _) => Some(thresholds.min_major_modifier_confidence),
+        (PriceTier::BaseItem, _) => Some(thresholds.min_base_item_confidence),
     };
     if let Some(required) = min_tier_confidence {
         if entry.confidence() < required {
@@ -321,10 +383,12 @@ pub fn evaluate(
         };
     }
 
-    let roi_multiplier = match tier {
-        PriceTier::Exact => 1.0,
-        PriceTier::MajorModifiers => thresholds.major_modifier_roi_multiplier,
-        PriceTier::BaseItem => thresholds.base_item_roi_multiplier,
+    // Same (tier, source) keying as the confidence gate above.
+    let roi_multiplier = match (tier, entry.source) {
+        (PriceTier::Exact, PriceSource::Live) => thresholds.live_exact_roi_multiplier,
+        (PriceTier::Exact, PriceSource::Historical) => 1.0,
+        (PriceTier::MajorModifiers, _) => thresholds.major_modifier_roi_multiplier,
+        (PriceTier::BaseItem, _) => thresholds.base_item_roi_multiplier,
     };
     let required_roi_percent = thresholds.min_roi_percent * roi_multiplier;
 
@@ -479,10 +543,12 @@ mod tests {
             ..Default::default()
         };
         // updated at tick 10, evaluated at tick 20 -> age 10, over the
-        // limit of 5.
+        // limit of 5. sample_size 20 clears min_live_exact_confidence
+        // (Medium, 10+) so this test reaches (and stays focused on) the
+        // staleness check, not the confidence-protection-session gate.
         let verdict = evaluate(
             &item(true, 100),
-            Some(price(1_000_000, 5, 10)),
+            Some(price(1_000_000, 20, 10)),
             20,
             &FeeSchedule::default(),
             &thresholds,
@@ -509,10 +575,12 @@ mod tests {
     fn live_price_a_few_ticks_old_is_still_usable_under_the_default() {
         let thresholds = FlipThresholds::default();
         // ~2 Hypixel tick intervals old (120s), well under the 3-minute
-        // default ceiling.
+        // default ceiling. sample_size 20 clears the confidence-
+        // protection-session Live-Exact floor so this test stays
+        // focused on staleness.
         let verdict = evaluate(
             &item(true, 1_000_000),
-            Some(price(2_000_000, 5, 0)),
+            Some(price(2_000_000, 20, 0)),
             120_000,
             &FeeSchedule::default(),
             &thresholds,
@@ -555,12 +623,14 @@ mod tests {
         // Same age as historical_price_days_old_is_still_usable above,
         // but source: Live -- must use the much shorter live ceiling,
         // not the historical one, proving the two are not conflated.
+        // sample_size 20 clears the Live-Exact confidence floor so this
+        // test stays focused on staleness.
         let thresholds = FlipThresholds::default();
         let seven_days_ms = 7 * 24 * 60 * 60 * 1000;
 
         let verdict = evaluate(
             &item(true, 1_000_000),
-            Some(price(2_000_000, 5, 0)),
+            Some(price(2_000_000, 20, 0)),
             seven_days_ms,
             &FeeSchedule::default(),
             &thresholds,
@@ -587,9 +657,11 @@ mod tests {
 
     #[test]
     fn zero_buy_price_is_invalid_not_a_divide_by_zero_panic() {
+        // sample_size 20 clears the Live-Exact confidence floor so this
+        // test reaches (and stays focused on) the zero-price check.
         let verdict = evaluate(
             &item(true, 0),
-            Some(price(1_000_000, 5, 100)),
+            Some(price(1_000_000, 20, 100)),
             100,
             &FeeSchedule::default(),
             &FlipThresholds::default(),
@@ -601,7 +673,7 @@ mod tests {
     fn zero_estimated_value_is_invalid() {
         let verdict = evaluate(
             &item(true, 100),
-            Some(price(0, 5, 100)),
+            Some(price(0, 20, 100)),
             100,
             &FeeSchedule::default(),
             &FlipThresholds::default(),
@@ -619,9 +691,10 @@ mod tests {
 
         // buy 1_000_000, resell at 2_000_000, 1% tax = 20_000.
         // net proceeds = 1_980_000, profit = 980_000, roi = 98%.
+        // sample_size 20 clears the Live-Exact confidence floor.
         let verdict = evaluate(
             &item(true, 1_000_000),
-            Some(price(2_000_000, 5, 100)),
+            Some(price(2_000_000, 20, 100)),
             100,
             &fees,
             &thresholds,
@@ -645,10 +718,12 @@ mod tests {
             ..Default::default()
         };
 
-        // Small real profit that doesn't clear min_profit.
+        // Small real profit that doesn't clear min_profit. sample_size
+        // 20 clears the Live-Exact confidence floor so this stays
+        // focused on the profit/ROI bar, not sample size.
         let verdict = evaluate(
             &item(true, 1_000_000),
-            Some(price(1_050_000, 5, 100)),
+            Some(price(1_050_000, 20, 100)),
             100,
             &FeeSchedule {
                 tax_rate: 0.0,
@@ -663,9 +738,10 @@ mod tests {
 
     #[test]
     fn overpriced_auction_is_a_signed_loss_not_a_panic() {
+        // sample_size 20 clears the Live-Exact confidence floor.
         let verdict = evaluate(
             &item(true, 2_000_000),
-            Some(price(1_000_000, 5, 100)),
+            Some(price(1_000_000, 20, 100)),
             100,
             &FeeSchedule::default(),
             &FlipThresholds::default(),
@@ -689,10 +765,12 @@ mod tests {
 
         // 100 -> 100_000_000 estimated value is a ~1000x "flip", almost
         // certainly bad data (e.g. a fingerprint collision or a troll
-        // listing skewing the cheapest-BIN sample), not real.
+        // listing skewing the cheapest-BIN sample), not real. sample_size
+        // 20 clears the Live-Exact confidence floor so this stays
+        // focused on plausibility, not sample size.
         let verdict = evaluate(
             &item(true, 100),
-            Some(price(100_000_000, 5, 100)),
+            Some(price(100_000_000, 20, 100)),
             100,
             &FeeSchedule::default(),
             &thresholds,
@@ -732,13 +810,49 @@ mod tests {
     // --- Tiered pricing: confidence gates ---
 
     #[test]
-    fn exact_tier_is_trusted_even_at_low_confidence() {
-        // sample_size 2 is below Medium (10) and High (50), but Tier 1
-        // has no confidence floor of its own -- only the flat
-        // min_sample_size gate applies.
+    fn historical_exact_tier_is_trusted_even_at_low_confidence() {
+        // Regression guard for "keep COFL historical pricing highest
+        // trust" (confidence-protection session): a
+        // (PriceTier::Exact, PriceSource::Historical) entry has no
+        // confidence floor, unchanged from before -- COFL's median-of-
+        // sold-prices stays unconditionally trusted regardless of
+        // sample_size.
         let verdict = evaluate(
             &item(true, 1_000_000),
-            Some(price(2_000_000, 2, 100)),
+            Some(historical_price(2_000_000, 2, 100)),
+            100,
+            &FeeSchedule::default(),
+            &FlipThresholds::default(),
+        );
+        assert!(!matches!(
+            verdict,
+            FlipVerdict::InsufficientSampleSize { .. }
+        ));
+    }
+
+    #[test]
+    fn live_exact_tier_below_medium_confidence_is_rejected() {
+        // confidence-protection session: unlike Historical, a
+        // (PriceTier::Exact, PriceSource::Live) entry now has its own
+        // confidence floor. sample_size 5 < Medium's threshold of 10.
+        let verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(price(2_000_000, 5, 100)),
+            100,
+            &FeeSchedule::default(),
+            &FlipThresholds::default(),
+        );
+        assert_eq!(
+            verdict,
+            FlipVerdict::InsufficientSampleSize { sample_size: 5 }
+        );
+    }
+
+    #[test]
+    fn live_exact_tier_at_medium_confidence_passes_the_gate() {
+        let verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(price(2_000_000, 10, 100)),
             100,
             &FeeSchedule::default(),
             &FlipThresholds::default(),
@@ -848,6 +962,82 @@ mod tests {
     }
 
     #[test]
+    fn live_exact_needs_a_bigger_roi_margin_than_historical_exact() {
+        // confidence-protection session: a Live-Exact entry (once past
+        // its own confidence floor) still needs more margin than a
+        // Historical-Exact one, even though both are Tier 1 -- source
+        // matters, not just tier.
+        let thresholds = FlipThresholds {
+            min_profit: 0,
+            min_roi_percent: 20.0,
+            ..Default::default()
+        };
+        // buy 1_000_000, resell 1_220_000, 0% tax => profit 220_000,
+        // roi 22%. Clears the flat 20% bar and Historical-Exact's
+        // (unmultiplied) 20% bar, but not Live-Exact's 20% * 1.2 = 24%.
+        let fees = FeeSchedule {
+            tax_rate: 0.0,
+            minimum_tax: 0,
+        };
+
+        let historical_verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(historical_price(1_220_000, 50, 100)),
+            100,
+            &fees,
+            &thresholds,
+        );
+        assert!(historical_verdict.is_flip());
+
+        let live_verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(price(1_220_000, 50, 100)),
+            100,
+            &fees,
+            &thresholds,
+        );
+        assert!(matches!(live_verdict, FlipVerdict::BelowThreshold(_)));
+    }
+
+    #[test]
+    fn live_exact_needs_a_smaller_roi_margin_than_major_modifiers() {
+        // Even though both are gated by the same confidence floor
+        // (Medium) once Live-sourced, an exact fingerprint match keeps
+        // a lighter ROI bar than a coarser Major-tier match -- "keep
+        // exact fingerprint priority" holds even under the new
+        // source-aware gating.
+        let thresholds = FlipThresholds {
+            min_profit: 0,
+            min_roi_percent: 20.0,
+            ..Default::default()
+        };
+        // 25% ROI clears Live-Exact's 20% * 1.2 = 24% bar but not
+        // Major's 20% * 1.5 = 30% bar.
+        let fees = FeeSchedule {
+            tax_rate: 0.0,
+            minimum_tax: 0,
+        };
+
+        let live_exact_verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(price(1_250_000, 50, 100)),
+            100,
+            &fees,
+            &thresholds,
+        );
+        assert!(live_exact_verdict.is_flip());
+
+        let major_verdict = evaluate(
+            &item(true, 1_000_000),
+            Some(tiered_price(1_250_000, 50, 100, PriceTier::MajorModifiers)),
+            100,
+            &fees,
+            &thresholds,
+        );
+        assert!(matches!(major_verdict, FlipVerdict::BelowThreshold(_)));
+    }
+
+    #[test]
     fn base_item_tier_needs_an_even_bigger_roi_margin() {
         let thresholds = FlipThresholds {
             min_profit: 0,
@@ -922,7 +1112,12 @@ mod bench {
         let cached_price = PriceLookup {
             entry: PriceEntry {
                 estimated_value: 1_500_000,
-                sample_size: 5,
+                // 20 clears the Live-Exact confidence floor added in
+                // the confidence-protection session (min_sample_size
+                // Medium = 10+) so this still measures evaluate()'s
+                // steady-state cost, not InsufficientSampleSize's
+                // early-return cost.
+                sample_size: 20,
                 updated_at_tick: 1,
                 source: PriceSource::Live,
             },
