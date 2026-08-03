@@ -4,13 +4,25 @@
 //! GET /api/auctions/tag/{tag}/sold (paginated, background/startup only)
 //!   -> CoflSoldAuction         (raw wire struct, lenient/optional fields)
 //!   -> HistoricalSale          (normalized, network-independent)
-//!   -> fingerprint_of()        (builds a synthetic ParsedItem, calls the
-//!                                SAME fingerprint::fingerprint() live
-//!                                auctions use)
-//!   -> grouped by Fingerprint, median sale price -> PriceEntry {
+//!   -> fingerprint_of() / major_modifier_key_of()
+//!                              (build a synthetic ParsedItem, call the
+//!                               SAME fingerprint::fingerprint() /
+//!                               fingerprint::major_modifier_key() live
+//!                               auctions use)
+//!   -> grouped three ways in parallel from the same sales -- by exact
+//!      Fingerprint, by major-modifier Fingerprint, and by bare item
+//!      tag -- median sale price per group -> PriceEntry {
 //!        source: PriceSource::Historical }
-//!   -> PriceCache::update_batch()
+//!   -> PriceCache::update_exact_batch() / update_major_batch() /
+//!      update_base_batch()
 //! ```
+//!
+//! One COFL sale seeds all three pricing tiers at once: it's an exact
+//! match for its own fingerprint, a major-modifier match for its item +
+//! reforge/stars/hpc/top-enchant combination, and a base-item match for
+//! its bare item tag. This is what lets Tier 2/3 fall back to *something*
+//! for items that rarely trade with the exact same modifiers, without
+//! ever requiring a second network round-trip.
 //!
 //! # Hot-path guarantee
 //!
@@ -135,12 +147,26 @@ pub struct ReconstructedAttributes {
 /// are guaranteed consistent by construction, not by keeping two
 /// implementations in sync by hand.
 pub fn fingerprint_of(sale: &HistoricalSale) -> Fingerprint {
+    fingerprint::fingerprint(&synthetic_item(sale))
+}
+
+/// Same idea as [`fingerprint_of`], but calls
+/// `fingerprint::major_modifier_key` (Tier 2's coarser key: item +
+/// reforge/stars/hpc/top-enchant, ignoring gems and minor enchants)
+/// instead of the full exact fingerprint. Built from the same synthetic
+/// item so the two are guaranteed consistent with each other and with
+/// what a live auction of the same sale would produce.
+pub fn major_modifier_key_of(sale: &HistoricalSale) -> Fingerprint {
+    fingerprint::major_modifier_key(&synthetic_item(sale))
+}
+
+fn synthetic_item(sale: &HistoricalSale) -> ParsedItem {
     let extra_attributes = sale
         .extra_attributes
         .clone()
         .unwrap_or_else(|| build_reconstructed_value(&sale.reconstructed));
 
-    let item = ParsedItem {
+    ParsedItem {
         uuid: String::new(),
         auctioneer: String::new(),
         skyblock_item_id: sale.item_tag.clone(),
@@ -150,9 +176,7 @@ pub fn fingerprint_of(sale: &HistoricalSale) -> Fingerprint {
         bin: true,
         end: sale.sold_at,
         extra_attributes: Some(extra_attributes),
-    };
-
-    fingerprint::fingerprint(&item)
+    }
 }
 
 fn build_reconstructed_value(r: &ReconstructedAttributes) -> Value {
@@ -443,13 +467,17 @@ impl CoflClient {
 /// what each field means; `sales_from_real_nbt` vs
 /// `sales_from_reconstruction` is the most useful signal for judging how
 /// much the `shortItemBytes` assumption actually held once this runs
-/// against live data.
+/// against live data. The three `*_entries_seeded` fields are seeded
+/// from the same sales, not additional fetches -- see the module doc
+/// comment.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ImportStats {
     pub item_tags_attempted: u32,
     pub sales_fetched: u64,
     pub fingerprints_loaded: u64,
-    pub cache_entries_seeded: u64,
+    pub exact_entries_seeded: u64,
+    pub major_modifier_entries_seeded: u64,
+    pub base_item_entries_seeded: u64,
     pub fetch_errors: u64,
     pub sales_from_real_nbt: u64,
     pub sales_from_reconstruction: u64,
@@ -469,8 +497,12 @@ pub async fn backfill(
     cache: &PriceCache,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
-    let mut grouped: HashMap<Fingerprint, Vec<u64>> = HashMap::new();
-    let mut latest_sale_at: HashMap<Fingerprint, i64> = HashMap::new();
+    let mut exact_grouped: HashMap<Fingerprint, Vec<u64>> = HashMap::new();
+    let mut exact_latest: HashMap<Fingerprint, i64> = HashMap::new();
+    let mut major_grouped: HashMap<Fingerprint, Vec<u64>> = HashMap::new();
+    let mut major_latest: HashMap<Fingerprint, i64> = HashMap::new();
+    let mut base_grouped: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut base_latest: HashMap<String, i64> = HashMap::new();
     let mut first_request = true;
 
     for tag in item_tags {
@@ -496,9 +528,28 @@ pub async fn backfill(
                         }
 
                         let fp = fingerprint_of(sale);
-                        grouped.entry(fp).or_default().push(sale.sale_price);
-                        latest_sale_at
+                        exact_grouped.entry(fp).or_default().push(sale.sale_price);
+                        exact_latest
                             .entry(fp)
+                            .and_modify(|t| *t = (*t).max(sale.sold_at))
+                            .or_insert(sale.sold_at);
+
+                        let major = major_modifier_key_of(sale);
+                        major_grouped
+                            .entry(major)
+                            .or_default()
+                            .push(sale.sale_price);
+                        major_latest
+                            .entry(major)
+                            .and_modify(|t| *t = (*t).max(sale.sold_at))
+                            .or_insert(sale.sold_at);
+
+                        base_grouped
+                            .entry(sale.item_tag.clone())
+                            .or_default()
+                            .push(sale.sale_price);
+                        base_latest
+                            .entry(sale.item_tag.clone())
                             .and_modify(|t| *t = (*t).max(sale.sold_at))
                             .or_insert(sale.sold_at);
                     }
@@ -512,31 +563,27 @@ pub async fn backfill(
         }
     }
 
-    stats.fingerprints_loaded = grouped.len() as u64;
+    stats.fingerprints_loaded = exact_grouped.len() as u64;
 
-    let updates: Vec<(Fingerprint, PriceEntry)> = grouped
-        .into_iter()
-        .map(|(fp, mut prices)| {
-            prices.sort_unstable();
-            let median = prices[prices.len() / 2];
-            let entry = PriceEntry {
-                estimated_value: median,
-                sample_size: prices.len() as u32,
-                updated_at_tick: latest_sale_at[&fp],
-                source: PriceSource::Historical,
-            };
-            (fp, entry)
-        })
-        .collect();
+    let exact_updates = median_entries(exact_grouped, &exact_latest);
+    let major_updates = median_entries(major_grouped, &major_latest);
+    let base_updates = median_entries(base_grouped, &base_latest);
 
-    stats.cache_entries_seeded = updates.len() as u64;
-    cache.update_batch(updates);
+    stats.exact_entries_seeded = exact_updates.len() as u64;
+    stats.major_modifier_entries_seeded = major_updates.len() as u64;
+    stats.base_item_entries_seeded = base_updates.len() as u64;
+
+    cache.update_exact_batch(exact_updates);
+    cache.update_major_batch(major_updates);
+    cache.update_base_batch(base_updates);
 
     info!(
         item_tags_attempted = stats.item_tags_attempted,
         sales_fetched = stats.sales_fetched,
         fingerprints_loaded = stats.fingerprints_loaded,
-        cache_entries_seeded = stats.cache_entries_seeded,
+        exact_entries_seeded = stats.exact_entries_seeded,
+        major_modifier_entries_seeded = stats.major_modifier_entries_seeded,
+        base_item_entries_seeded = stats.base_item_entries_seeded,
         fetch_errors = stats.fetch_errors,
         sales_from_real_nbt = stats.sales_from_real_nbt,
         sales_from_reconstruction = stats.sales_from_reconstruction,
@@ -544,6 +591,29 @@ pub async fn backfill(
     );
 
     stats
+}
+
+/// Shared median-and-latest-timestamp reduction used for all three
+/// pricing tiers -- only the grouping key type differs (`Fingerprint`
+/// for Tier 1/2, `String` item tag for Tier 3).
+fn median_entries<K: Eq + std::hash::Hash>(
+    grouped: HashMap<K, Vec<u64>>,
+    latest_sale_at: &HashMap<K, i64>,
+) -> Vec<(K, PriceEntry)> {
+    grouped
+        .into_iter()
+        .map(|(key, mut prices)| {
+            prices.sort_unstable();
+            let median = prices[prices.len() / 2];
+            let entry = PriceEntry {
+                estimated_value: median,
+                sample_size: prices.len() as u32,
+                updated_at_tick: latest_sale_at[&key],
+                source: PriceSource::Historical,
+            };
+            (key, entry)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -814,18 +884,72 @@ mod tests {
 
         assert_eq!(stats.sales_fetched, 2);
         assert_eq!(stats.fingerprints_loaded, 1);
-        assert_eq!(stats.cache_entries_seeded, 1);
+        assert_eq!(stats.exact_entries_seeded, 1);
+        assert_eq!(stats.major_modifier_entries_seeded, 1);
+        assert_eq!(stats.base_item_entries_seeded, 1);
 
-        let fp = fingerprint_of(&HistoricalSale {
+        let sample_sale = HistoricalSale {
             item_tag: "HYPERION".into(),
             sale_price: 0,
             sold_at: 0,
             extra_attributes: None,
             reconstructed: ReconstructedAttributes::default(),
-        });
-        let entry = cache.get(fp).unwrap();
-        assert_eq!(entry.sample_size, 2);
-        assert_eq!(entry.source, PriceSource::Historical);
-        assert_eq!(entry.estimated_value, 2_000_000);
+        };
+
+        let exact_entry = cache.get_exact(fingerprint_of(&sample_sale)).unwrap();
+        assert_eq!(exact_entry.sample_size, 2);
+        assert_eq!(exact_entry.source, PriceSource::Historical);
+        assert_eq!(exact_entry.estimated_value, 2_000_000);
+
+        let major_entry = cache
+            .get_major(major_modifier_key_of(&sample_sale))
+            .unwrap();
+        assert_eq!(major_entry.sample_size, 2);
+        assert_eq!(major_entry.estimated_value, 2_000_000);
+
+        let base_entry = cache.get_base("HYPERION").unwrap();
+        assert_eq!(base_entry.sample_size, 2);
+        assert_eq!(base_entry.estimated_value, 2_000_000);
+    }
+
+    #[tokio::test]
+    async fn backfill_seeds_the_major_modifier_and_base_tiers_across_distinct_exact_fingerprints() {
+        // Two sales of the same item with different hot potato counts
+        // land in different Tier 1 (exact) and Tier 2 (major modifier,
+        // since hot_potato_count is part of that key too) buckets, but
+        // both still contribute to the same Tier 3 (bare item tag)
+        // bucket -- proving Tier 3 aggregates across modifier variance
+        // that the finer tiers deliberately keep separate.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/auctions/tag/HYPERION/sold"))
+            .and(query_param("page", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"tag": "HYPERION", "startingBid": 1000000, "bin": true, "end": "2021-01-01T00:00:00Z", "flattenedNbt": {"hot_potato_count": "5"}},
+                {"tag": "HYPERION", "startingBid": 3000000, "bin": true, "end": "2021-01-02T00:00:00Z", "flattenedNbt": {"hot_potato_count": "10"}},
+            ])))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/auctions/tag/HYPERION/sold"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let client = CoflClient::new(server.uri()).unwrap();
+        let cache = PriceCache::new();
+
+        let stats = backfill(&client, &["HYPERION".to_string()], 5, &cache).await;
+
+        // Two distinct exact fingerprints (different hot_potato_count).
+        assert_eq!(stats.exact_entries_seeded, 2);
+        // Both sales collapse into the same Tier 3 bucket.
+        assert_eq!(stats.base_item_entries_seeded, 1);
+
+        let base_entry = cache.get_base("HYPERION").unwrap();
+        assert_eq!(base_entry.sample_size, 2);
     }
 }

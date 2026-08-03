@@ -69,6 +69,77 @@ pub fn fingerprint(item: &ParsedItem) -> Fingerprint {
     Fingerprint(hasher.finish())
 }
 
+/// A coarser fingerprint over just the modifiers with the largest price
+/// impact: item id, reforge, recombobulated, stars, hot potato count,
+/// and the single *highest-level* enchantment (not the full enchant
+/// set). Used as the Tier 2 pricing fallback (see `pricing` crate) when
+/// no exact-fingerprint match exists.
+///
+/// The top enchantment is deliberately included here, not left for
+/// Tier 3: many items (enchanted books above all — their
+/// `skyblock_item_id` is generically `ENCHANTED_BOOK` regardless of
+/// which enchant it is) have no price-defining signal *other than*
+/// their enchantments, so a "major modifiers" tier that excluded
+/// enchantments entirely would be useless for them. Gems, runes,
+/// ability scrolls, skin, enrichment, and every enchantment other than
+/// the top one are intentionally left out — those are exactly what
+/// distinguishes this from the full [`fingerprint`].
+///
+/// Pure and synchronous, zero heap allocation: the top-enchantment scan
+/// is a running-max fold, not a sort (unlike the full fingerprint's
+/// `enchantments`/`runes`/`gems` handling, which needs to sort for
+/// order-independence since it hashes the *whole* set).
+pub fn major_modifier_key(item: &ParsedItem) -> Fingerprint {
+    let mut hasher = DefaultHasher::new();
+
+    item.skyblock_item_id.hash(&mut hasher);
+
+    let attrs = item.extra_attributes.as_ref().and_then(as_compound);
+
+    hash_opt_str(&mut hasher, field_str(attrs, "modifier"));
+    (field_int(attrs, "rarity_upgrades").unwrap_or(0) >= 1).hash(&mut hasher);
+    field_int(attrs, "hot_potato_count")
+        .unwrap_or(0)
+        .hash(&mut hasher);
+    field_int(attrs, "dungeon_item_level")
+        .unwrap_or(0)
+        .hash(&mut hasher);
+
+    let top_enchant = field_compound(attrs, "enchantments").and_then(top_enchantment);
+    hash_opt_enchant(&mut hasher, top_enchant);
+
+    Fingerprint(hasher.finish())
+}
+
+/// The single highest-level enchantment in `map`, tie-broken by
+/// lexicographically smallest name for determinism. A linear
+/// running-max fold — no allocation, unlike sorting the whole set.
+fn top_enchantment(map: &HashMap<String, Value>) -> Option<(&str, i64)> {
+    map.iter()
+        .filter_map(|(k, v)| as_int(v).map(|n| (k.as_str(), n)))
+        .fold(None, |best, (name, level)| match best {
+            None => Some((name, level)),
+            Some((best_name, best_level)) => {
+                if level > best_level || (level == best_level && name < best_name) {
+                    Some((name, level))
+                } else {
+                    Some((best_name, best_level))
+                }
+            }
+        })
+}
+
+fn hash_opt_enchant<H: Hasher>(hasher: &mut H, value: Option<(&str, i64)>) {
+    match value {
+        Some((name, level)) => {
+            1u8.hash(hasher);
+            name.hash(hasher);
+            level.hash(hasher);
+        }
+        None => 0u8.hash(hasher),
+    }
+}
+
 fn as_compound(value: &Value) -> Option<&HashMap<String, Value>> {
     match value {
         Value::Compound(map) => Some(map),
@@ -443,5 +514,98 @@ mod tests {
         let b = base_item("ENCHANTED_BOOK", None);
 
         assert_eq!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn major_modifier_key_ignores_gems_but_full_fingerprint_does_not() {
+        let plain = base_item(
+            "HYPERION",
+            Some(compound(vec![("hot_potato_count", Value::Int(10))])),
+        );
+        let gemmed = base_item(
+            "HYPERION",
+            Some(compound(vec![
+                ("hot_potato_count", Value::Int(10)),
+                (
+                    "gems",
+                    compound(vec![("COMBAT_0", Value::String("RUBY".to_string()))]),
+                ),
+            ])),
+        );
+
+        assert_eq!(major_modifier_key(&plain), major_modifier_key(&gemmed));
+        assert_ne!(fingerprint(&plain), fingerprint(&gemmed));
+    }
+
+    #[test]
+    fn major_modifier_key_is_sensitive_to_stars_and_reforge() {
+        let a = base_item(
+            "HYPERION",
+            Some(compound(vec![("dungeon_item_level", Value::Int(5))])),
+        );
+        let b = base_item(
+            "HYPERION",
+            Some(compound(vec![("dungeon_item_level", Value::Int(0))])),
+        );
+
+        assert_ne!(major_modifier_key(&a), major_modifier_key(&b));
+    }
+
+    #[test]
+    fn major_modifier_key_picks_the_highest_level_enchantment() {
+        let a = base_item(
+            "ENCHANTED_BOOK",
+            Some(compound(vec![(
+                "enchantments",
+                compound(vec![
+                    ("sharpness", Value::Int(7)),
+                    ("looting", Value::Int(2)),
+                ]),
+            )])),
+        );
+        let b = base_item(
+            "ENCHANTED_BOOK",
+            Some(compound(vec![(
+                "enchantments",
+                compound(vec![
+                    ("sharpness", Value::Int(7)),
+                    ("looting", Value::Int(5)),
+                ]),
+            )])),
+        );
+
+        // Both share the same top enchant (sharpness 7); the
+        // lower-priority "looting" level differing shouldn't matter to
+        // the major-modifier key, only to the full fingerprint.
+        assert_eq!(major_modifier_key(&a), major_modifier_key(&b));
+        assert_ne!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn major_modifier_key_changes_when_the_top_enchantment_changes() {
+        let a = base_item(
+            "ENCHANTED_BOOK",
+            Some(compound(vec![(
+                "enchantments",
+                compound(vec![("sharpness", Value::Int(6))]),
+            )])),
+        );
+        let b = base_item(
+            "ENCHANTED_BOOK",
+            Some(compound(vec![(
+                "enchantments",
+                compound(vec![("sharpness", Value::Int(7))]),
+            )])),
+        );
+
+        assert_ne!(major_modifier_key(&a), major_modifier_key(&b));
+    }
+
+    #[test]
+    fn major_modifier_key_is_deterministic_without_extra_attributes() {
+        let a = base_item("HYPERION", None);
+        let b = base_item("HYPERION", None);
+
+        assert_eq!(major_modifier_key(&a), major_modifier_key(&b));
     }
 }

@@ -55,6 +55,21 @@ competitive edge comes from:
   freshness expectations, and `engine::FlipThresholds` applies a
   different staleness ceiling to each (minutes vs. 30 days) — see the
   `pricing`/`engine`/`cofl` entries below.
+- **Pricing is three-tier (tiered pricing session):** `PriceCache::get`
+  tries an exact fingerprint match first (Tier 1), falls back to a
+  coarser "major modifier" key — item + reforge/stars/hot-potato-count/
+  top-enchant, ignoring gems and minor enchants — (Tier 2), and finally
+  falls back to the bare item id alone (Tier 3). All three lookups stay
+  on the hot path (no I/O, no locking, no allocation) — see the
+  `pricing` entry below for the latency numbers. `engine::evaluate`
+  compensates for the coarser tiers' lower trustworthiness with a
+  minimum-confidence gate (derived from `PriceEntry.sample_size`) and a
+  per-tier ROI multiplier, rather than ever loosening `min_profit`
+  itself — see the `engine` entry below. `cofl::backfill` and the live
+  ingestion feed both seed all three tiers from the same observations
+  (one sale/sighting contributes to its own exact fingerprint, its
+  major-modifier bucket, and its base-item bucket simultaneously) — see
+  the `cofl` and `ingestion/main.rs` entries below.
 - **Messaging: NATS**, not Kafka — chosen for latency and operational
   simplicity, not durability (flips are worthless seconds after Hypixel's
   next tick). NATS only sits between "matched flip" and "fan-out to many
@@ -244,20 +259,31 @@ skyblock-flipper/
         │                          so a slow/rate-limited backfill can
         │                          never delay the ingestion loop's
         │                          first tick; it only ever calls
-        │                          PriceCache::update_batch, the same
-        │                          non-blocking write path the live
-        │                          feed below uses.
+        │                          PriceCache::update_exact_batch/
+        │                          update_major_batch/update_base_batch,
+        │                          the same non-blocking write paths the
+        │                          live feed below uses.
         │                          Channel receiver runs each snapshot
         │                          through diff::DiffDetector, then
         │                          parser::parse_item on each changed
         │                          auction (parse failures are logged
-        │                          and skipped, not fatal), then
-        │                          fingerprint::fingerprint on every
-        │                          parsed item. For each item, looks up
-        │                          pricing::PriceCache::get(fp) — the
-        │                          cache's state from *prior* ticks —
-        │                          and passes it to engine::evaluate().
-        │                          A FlipVerdict::Flip builds a
+        │                          and skipped, not fatal), then, for
+        │                          each parsed item,
+        │                          fingerprint::fingerprint (Tier 1 key)
+        │                          AND (tiered pricing session)
+        │                          fingerprint::major_modifier_key
+        │                          (Tier 2 key). Looks up
+        │                          pricing::PriceCache::get(exact, major,
+        │                          &item.skyblock_item_id) — the cache's
+        │                          state from *prior* ticks, tried Tier 1
+        │                          then Tier 2 then Tier 3 (base item id,
+        │                          no extra key needed) inside get()
+        │                          itself — and passes the resulting
+        │                          Option<PriceLookup> to
+        │                          engine::evaluate(), which applies the
+        │                          tier-appropriate confidence gate and
+        │                          ROI multiplier (see the engine entry
+        │                          above). A FlipVerdict::Flip builds a
         │                          notify::FlipAlert (from ParsedItem +
         │                          ProfitCalculation fields) and
         │                          collects it into a per-tick
@@ -269,23 +295,42 @@ skyblock-flipper/
         │                          is silently skipped. Only *after*
         │                          every item in the batch has been
         │                          evaluated does it fold this tick's
-        │                          cheapest-BIN-per-fingerprint
-        │                          observations into the price cache
-        │                          via update_batch() — this ordering
-        │                          is load-bearing: evaluating against
+        │                          cheapest-BIN observations into the
+        │                          price cache — now via a shared
+        │                          accumulate_cheapest_bin() helper
+        │                          (generic over the key type) called
+        │                          three times per BIN item, once per
+        │                          tier (exact fingerprint, major-
+        │                          modifier key, bare item id — mirroring
+        │                          how cofl::backfill seeds all three
+        │                          tiers from one COFL sale), then
+        │                          update_exact_batch/update_major_batch/
+        │                          update_base_batch — this ordering is
+        │                          still load-bearing: evaluating against
         │                          a cache already updated with this
         │                          same tick's data would let an
         │                          auction get judged against a
         │                          "market price" derived from itself
         │                          or its same-tick siblings. NOTE:
         │                          "cheapest BIN this tick" remains a
-        │                          placeholder value source, not a
-        │                          real fair-value estimate; this
-        │                          entry's source is always
+        │                          placeholder value source at every
+        │                          tier, not a real fair-value estimate;
+        │                          this entry's source is always
         │                          PriceSource::Live (COFL-seeded
         │                          entries only ever come from the
         │                          background backfill task above and
-        │                          use PriceSource::Historical). Then
+        │                          use PriceSource::Historical). Three
+        │                          new cumulative diagnostic counters
+        │                          (diag_tier_exact_hit_total,
+        │                          diag_tier_major_modifier_hit_total,
+        │                          diag_tier_base_item_hit_total) track
+        │                          which tier each cache hit resolved
+        │                          at, logged alongside the existing
+        │                          diag_* fields — useful for judging on
+        │                          a live run whether Tier 2/3 fallbacks
+        │                          are actually contributing flips or
+        │                          just adding rejected
+        │                          InsufficientSampleSize verdicts. Then
         │                          runs
         │                          notify::FlipDeduplicator::filter_new
         │                          on the whole tick's flip_candidates
@@ -413,74 +458,199 @@ skyblock-flipper/
     │                               hash, None-vs-empty-string not
     │                               colliding, and hash independence
     │                               from HashMap insertion order.
-    ├── pricing/                    DONE: in-memory price cache.
-    │   src/lib.rs                   PriceCache: SHARD_COUNT=64
-    │                               independent ArcSwap<HashMap<
+    │                               (tiered pricing session) Also exports
+    │                               major_modifier_key(&ParsedItem) ->
+    │                               Fingerprint — Tier 2's coarser key.
+    │                               Hashes only skyblock_item_id,
+    │                               modifier (reforge), rarity_upgrades
+    │                               (recomb, as a bool — any amount of
+    │                               upgrade counts the same), hot_potato_
+    │                               count, dungeon_item_level (stars),
+    │                               and the single highest-level
+    │                               enchantment (tie-broken by
+    │                               lexicographically smallest name) —
+    │                               deliberately excludes gems and every
+    │                               enchant but the top one. The top-
+    │                               enchantment inclusion is a deliberate
+    │                               design call, not an oversight: most
+    │                               enchanted items' skyblock_item_id is
+    │                               generically ENCHANTED_BOOK regardless
+    │                               of which enchant it is, so without at
+    │                               least the dominant enchant, Tier 2
+    │                               would be useless for the entire
+    │                               enchanted-book market. Picks the
+    │                               highest level via a linear running-
+    │                               max fold (no allocation, unlike the
+    │                               full fingerprint's sorted-Vec
+    │                               approach — Tier 2 only needs one
+    │                               enchant, not a stable sort of all of
+    │                               them). 5 new unit tests (16 total in
+    │                               the crate) cover: gems affecting the
+    │                               full fingerprint but not the major-
+    │                               modifier key, stars/reforge still
+    │                               affecting the major-modifier key,
+    │                               picking the highest-level enchant
+    │                               correctly, the key changing when the
+    │                               top enchant changes, and determinism
+    │                               with no ExtraAttributes at all.
+    ├── pricing/                    DONE: in-memory price cache. Rewritten
+    │   src/lib.rs                   in the tiered-pricing session into a
+    │                               three-tier structure — see the
+    │                               "Pricing is three-tier" architecture
+    │                               bullet above for the motivation.
+    │                               PriceCache now holds three maps: `exact`
+    │                               and `major` are each a
+    │                               FingerprintShardedMap (the original
+    │                               SHARD_COUNT=64 ArcSwap<HashMap<
     │                               Fingerprint, PriceEntry,
-    │                               FingerprintHasher>> shards (the
-    │                               arc-swap crate's RCU/atomic-swap
-    │                               pattern named in the architecture
-    │                               decisions above). Shard index is
-    │                               fingerprint.0 & (SHARD_COUNT - 1).
-    │                               get(fingerprint) is wait-free: one
-    │                               atomic load + a hashmap probe using
-    │                               FingerprintHasher (an identity
-    │                               hasher — Fingerprint is already a
-    │                               well-distributed u64, so this skips
-    │                               a redundant SipHash pass), no
-    │                               allocation, no locking, never
-    │                               blocked by a concurrent writer.
-    │                               Missing entries return None rather
-    │                               than panicking or blocking.
-    │                               update_batch(...) groups updates by
-    │                               shard, then does one .rcu() per
-    │                               touched shard (clone-on-write +
-    │                               compare-and-swap retry, so
-    │                               concurrent writers to the same
-    │                               shard never lose an update to a
-    │                               race, and never block a concurrent
-    │                               get()). PriceEntry is a fixed-size
-    │                               Copy struct: estimated_value (u64
-    │                               coins), sample_size (u32),
-    │                               updated_at_tick (i64 — actually a
-    │                               raw Hypixel epoch-millis timestamp
-    │                               despite the "tick" name; see the
-    │                               engine entry's bug-fix note below),
-    │                               and (added in the COFL session)
-    │                               source: PriceSource (Live |
-    │                               Historical) so engine::evaluate can
-    │                               apply a different staleness ceiling
-    │                               to a live-fed price vs a COFL-
-    │                               backfilled one. What estimated_value
-    │                               means (median? trimmed mean?) is
-    │                               still deliberately left to the
-    │                               caller/profit engine, not this
-    │                               crate. 7 unit tests (empty
-    │                               cache, insert/read, overwrite,
-    │                               500 entries across shards, empty
-    │                               batch no-op, concurrent same-shard
-    │                               writers not losing data, reads not
-    │                               blocking a concurrent writer) plus
-    │                               one #[ignore]'d benchmark
-    │                               (`cargo test -p pricing --release
-    │                               -- --ignored --nocapture`) —
-    │                               measured ~55 ns/op for get() over
-    │                               50,000 entries on the machine this
-    │                               was built on, well inside the <1 µs
-    │                               budget line below.
+    │                               FingerprintHasher>> sharding/RCU logic,
+    │                               extracted into a private struct and
+    │                               reused for both, since both tiers key
+    │                               by Fingerprint — Tier 1 the full
+    │                               fingerprint, Tier 2 the coarser
+    │                               fingerprint::major_modifier_key); `base`
+    │                               is a single unsharded
+    │                               ArcSwap<HashMap<String, PriceEntry>>
+    │                               keyed by bare item id — Tier 3's key
+    │                               space (distinct SkyBlock item ids) is
+    │                               small enough that sharding wouldn't
+    │                               meaningfully cut contention. Shard index
+    │                               is still fingerprint.0 & (SHARD_COUNT -
+    │                               1). get(exact, major, base_item_id) ->
+    │                               Option<PriceLookup> tries Tier 1, then
+    │                               Tier 2, then Tier 3 in that fixed order
+    │                               (never the other way — "keep exact
+    │                               fingerprint as the highest priority" is
+    │                               a hard requirement, not just a
+    │                               preference) and tags the hit with which
+    │                               tier it came from
+    │                               (PriceLookup { entry: PriceEntry, tier:
+    │                               PriceTier }, PriceTier ∈ {Exact,
+    │                               MajorModifiers, BaseItem}); individual
+    │                               get_exact/get_major/get_base accessors
+    │                               are also public for callers that only
+    │                               need one tier (e.g. cofl's tests). All
+    │                               lookups stay wait-free: one atomic load
+    │                               per tier tried + a hashmap probe, no
+    │                               allocation, no locking — Tier 3's
+    │                               `&str` lookup against
+    │                               HashMap<String, _> works via the Borrow
+    │                               trait, so it never requires an owned
+    │                               String either (explicitly tested).
+    │                               update_exact_batch/update_major_batch/
+    │                               update_base_batch each do their own
+    │                               RCU (.rcu() per touched shard for the
+    │                               sharded tiers, one .rcu() for the
+    │                               unsharded base tier) — same
+    │                               clone-on-write + compare-and-swap
+    │                               semantics as before, still never
+    │                               blocking a concurrent get(). PriceEntry
+    │                               is unchanged in shape (estimated_value:
+    │                               u64, sample_size: u32,
+    │                               updated_at_tick: i64 — raw Hypixel
+    │                               epoch-millis despite the "tick" name,
+    │                               see the engine entry's bug-fix note —
+    │                               source: PriceSource), plus a new
+    │                               confidence() -> Confidence method.
+    │                               Confidence is a 3-value ordered enum
+    │                               (Low < Medium < High) derived from
+    │                               sample_size via
+    │                               Confidence::from_sample_size: High
+    │                               requires >= 50, Medium >= 10, else Low.
+    │                               These thresholds are a deliberate
+    │                               deviation from the task's own
+    │                               illustrative example ("200 = high, 5 =
+    │                               low") — a literal 200-sample bar would
+    │                               make High confidence essentially
+    │                               unreachable for most SkyBlock items,
+    │                               undermining the "many consistent
+    │                               flips" goal the thresholds are supposed
+    │                               to serve; 10/50 keeps the intent
+    │                               (more samples = more trust) while
+    │                               staying reachable. What estimated_value
+    │                               means (median? trimmed mean?) is still
+    │                               deliberately left to the caller/profit
+    │                               engine, not this crate. 16 unit tests
+    │                               (confidence thresholds/ordering, get()
+    │                               falling back correctly through all
+    │                               three tiers in priority order, exact
+    │                               always winning when all three have
+    │                               data, per-tier overwrite semantics,
+    │                               cross-shard isolation, empty-batch
+    │                               no-ops at every tier, concurrent
+    │                               writers not losing data, reads never
+    │                               blocking a writer, and the Tier-3
+    │                               borrowed-&str-lookup property) plus two
+    │                               #[ignore]'d benchmarks (`cargo test -p
+    │                               pricing --release -- --ignored
+    │                               --nocapture`) — measured ~73 ns/op for
+    │                               a Tier-1 hit over 50,000 entries
+    │                               (essentially unchanged from the
+    │                               pre-tiering ~55 ns/op) and ~311 ns/op
+    │                               for the worst case (a miss at all three
+    │                               tiers) — both still well inside the
+    │                               <1 µs budget line below.
     ├── engine/                     DONE: profit calculation engine.
     │   src/lib.rs                   evaluate(item, price: Option<
-    │                               PriceEntry>, current_tick, fees:
+    │                               PriceLookup>, current_tick, fees:
     │                               &FeeSchedule, thresholds:
     │                               &FlipThresholds) -> FlipVerdict.
+    │                               (tiered pricing session) Signature
+    │                               changed from Option<PriceEntry> to
+    │                               Option<PriceLookup> — the caller still
+    │                               does the cache lookup and passes the
+    │                               result in, same decoupling as before,
+    │                               just carrying which tier the price
+    │                               came from alongside the entry itself.
     │                               Pure/sync, no I/O, no async,
     │                               depends only on parser (ParsedItem)
-    │                               and pricing (PriceEntry type only —
-    │                               NOT PriceCache; the caller does the
-    │                               cache lookup and passes the
-    │                               Option<PriceEntry> in, which is
-    │                               also why this crate doesn't depend
-    │                               on the fingerprint crate at all).
+    │                               and pricing (PriceLookup/PriceEntry/
+    │                               PriceSource/PriceTier/Confidence
+    │                               types only — NOT PriceCache; this
+    │                               crate still doesn't depend on the
+    │                               fingerprint crate at all).
+    │                               Before the profit math, two new
+    │                               tier-aware gates run (only for
+    │                               PriceTier::MajorModifiers/BaseItem —
+    │                               PriceTier::Exact skips both and only
+    │                               ever faces the flat min_sample_size
+    │                               gate, since an exact fingerprint match
+    │                               is already the most trustworthy signal
+    │                               available): (1) a minimum-confidence
+    │                               gate — entry.confidence() must be >=
+    │                               thresholds.min_major_modifier_confidence
+    │                               (default Confidence::Medium, i.e.
+    │                               sample_size >= 10) for Tier 2, or >=
+    │                               thresholds.min_base_item_confidence
+    │                               (default Confidence::High, i.e.
+    │                               sample_size >= 50) for Tier 3 —
+    │                               otherwise FlipVerdict::
+    │                               InsufficientSampleSize, the same
+    │                               variant the flat min_sample_size gate
+    │                               already used; (2) an ROI multiplier —
+    │                               the computed roi_percent must clear
+    │                               min_roi_percent *
+    │                               thresholds.major_modifier_roi_multiplier
+    │                               (default 1.5) for Tier 2, or *
+    │                               thresholds.base_item_roi_multiplier
+    │                               (default 3.0) for Tier 3, vs. the flat
+    │                               min_roi_percent for Tier 1 — while
+    │                               min_profit is deliberately left
+    │                               unmultiplied at every tier, since it's
+    │                               what makes a flip worth clicking at
+    │                               all ("coins/hour"), not a data-quality
+    │                               signal. Net effect: Tier 3 only ever
+    │                               reports "obviously" underpriced
+    │                               auctions with deep sample support,
+    │                               matching the task's own phrasing,
+    │                               while Tier 2 stays useful for the
+    │                               "many consistent 1-10m flips" goal
+    │                               without being priced out entirely.
+    │                               ProfitCalculation gained a `tier:
+    │                               PriceTier` field so downstream
+    │                               consumers (logging, notifications)
+    │                               can see how a reported flip's price
+    │                               was derived.
     │                               Profit formula: tax =
     │                               max(estimated_value * tax_rate,
     │                               minimum_tax); expected_profit =
@@ -516,19 +686,30 @@ skyblock-flipper/
     │                               plausible-ROI ceiling (an
     │                               implausibly good "flip" is treated
     │                               as more likely bad cache data than
-    │                               a real opportunity). 13 unit tests
-    │                               cover every FlipVerdict variant,
+    │                               a real opportunity). 26 unit tests
+    │                               (13 original + 5 staleness + 8 new in
+    │                               the tiered-pricing session: Tier 1
+    │                               trusted at low confidence,
+    │                               Tier 2/Tier 3 rejected below their
+    │                               confidence floor and passing at/above
+    │                               it, Tier 2/Tier 3 needing a bigger ROI
+    │                               margin than Tier 1, and
+    │                               ProfitCalculation reporting the right
+    │                               tier) cover every FlipVerdict variant,
     │                               overflow/panic safety at extreme
     │                               values, and a hand-computed profit/
     │                               tax/ROI example. One #[ignore]'d
     │                               benchmark (`cargo test -p engine
     │                               --release -- --ignored --nocapture`)
-    │                               measured ~2.9 ns/op for evaluate()
-    │                               — note this doesn't include the
-    │                               cache lookup itself (~55 ns,
-    │                               measured separately in pricing),
-    │                               since evaluate() takes an already-
-    │                               resolved price.
+    │                               measured ~3.8 ns/op for evaluate()
+    │                               post-tiering (was ~2.9 ns/op
+    │                               pre-tiering — the confidence/
+    │                               multiplier logic added negligible
+    │                               overhead) — note this doesn't include
+    │                               the cache lookup itself (~73 ns for a
+    │                               Tier-1 hit, measured separately in
+    │                               pricing), since evaluate() takes an
+    │                               already-resolved price.
     │                               **CONFIRMED BUG FIXED (COFL
     │                               session):** `tick`/`updated_at_tick`
     │                               are raw Hypixel epoch-millis, not a
@@ -649,15 +830,35 @@ skyblock-flipper/
     │                               field, not the whole record) ->
     │                               HistoricalSale (normalized, network-
     │                               independent, unit tested without
-    │                               wiremock) -> fingerprint_of()
-    │                               (builds a synthetic ParsedItem,
-    │                               calls the SAME fingerprint::
-    │                               fingerprint() live auctions use —
-    │                               not a parallel implementation) ->
-    │                               grouped by Fingerprint, median sale
-    │                               price -> PriceEntry { source:
+    │                               wiremock) -> fingerprint_of() /
+    │                               major_modifier_key_of() (tiered
+    │                               pricing session: both build a shared
+    │                               synthetic_item() ParsedItem, then call
+    │                               the SAME fingerprint::fingerprint() /
+    │                               fingerprint::major_modifier_key() live
+    │                               auctions use — not parallel
+    │                               implementations) -> grouped three ways
+    │                               in parallel from the same sales — by
+    │                               exact Fingerprint, by major-modifier
+    │                               Fingerprint, and by bare item tag —
+    │                               median sale price per group (shared
+    │                               median_entries() helper, generic over
+    │                               the key type) -> PriceEntry { source:
     │                               Historical } -> PriceCache::
-    │                               update_batch(). Two-tier accuracy:
+    │                               update_exact_batch() /
+    │                               update_major_batch() /
+    │                               update_base_batch(). One COFL sale now
+    │                               seeds all three pricing tiers at once
+    │                               — it's simultaneously an exact match
+    │                               for its own fingerprint, a
+    │                               major-modifier match for its item +
+    │                               reforge/stars/hpc/top-enchant
+    │                               combination, and a base-item match for
+    │                               its bare item tag — without any
+    │                               additional network round-trip. Two-tier
+    │                               accuracy (unrelated to pricing tiers —
+    │                               this is about how faithfully one
+    │                               sale's modifiers are reconstructed):
     │                               primary path decodes SoldAuction.
     │                               shortItemBytes ("NBT data as base64
     │                               encoded string" per its doc comment)
@@ -692,20 +893,29 @@ skyblock-flipper/
     │                               gracefully where a wrong guess
     │                               would silently corrupt the
     │                               fingerprint. ImportStats tracks
-    │                               (all 3 requirements from the task):
     │                               item_tags_attempted, sales_fetched,
-    │                               fingerprints_loaded,
-    │                               cache_entries_seeded, fetch_errors,
-    │                               and sales_from_real_nbt vs
+    │                               fingerprints_loaded, fetch_errors,
+    │                               sales_from_real_nbt vs
     │                               sales_from_reconstruction (the
     │                               single most useful live-run signal
     │                               for judging whether the
-    │                               shortItemBytes assumption held).
-    │                               backfill() rate-limits itself
+    │                               shortItemBytes assumption held), and
+    │                               (renamed/split in the tiered-pricing
+    │                               session from the old single
+    │                               cache_entries_seeded field)
+    │                               exact_entries_seeded,
+    │                               major_modifier_entries_seeded, and
+    │                               base_item_entries_seeded — seeded from
+    │                               the same sales, not additional
+    │                               fetches, so these three can differ a
+    │                               lot from each other (e.g. many
+    │                               distinct exact fingerprints but few
+    │                               base item tags) without anything being
+    │                               wrong. backfill() rate-limits itself
     │                               (350ms between requests) and is
     │                               meant to run once at startup,
     │                               concurrently with (not blocking)
-    │                               ingestion — see main.rs above. 13
+    │                               ingestion — see main.rs above. 14
     │                               unit tests, including one proving
     │                               the shortItemBytes decode path
     │                               produces byte-identical fingerprints
@@ -713,10 +923,14 @@ skyblock-flipper/
     │                               reconstruction fallback matches the
     │                               real-NBT path when the assumed key
     │                               names hold (a regression check on
-    │                               the assumptions themselves), and a
+    │                               the assumptions themselves), a
     │                               wiremock-based end-to-end test of
-    │                               backfill() seeding the cache from a
-    │                               multi-sale, multi-page response.
+    │                               backfill() seeding all three tiers
+    │                               from a multi-sale, multi-page
+    │                               response, and (new) a test proving
+    │                               two sales with different modifiers
+    │                               land in different Tier 1/2 buckets
+    │                               but the same Tier 3 bucket.
     └── storage/                   DONE: async auction/price storage.
         src/lib.rs                  SnapshotStore::open(db_path) opens
                                    (creates) a SQLite file (rusqlite,
@@ -764,10 +978,13 @@ the ICU4X crate family, which requires edition2024 (unsupported on
   at ~46,800 auctions each (e.g. `tick=1785736343562 auctions=46840`).
   The "not yet verified" caveat from earlier sessions is resolved.
 - `cargo build --workspace` — passes (debug and `--release`)
-- `cargo test --workspace` — passes (75 run + 2 `#[ignore]`'d
-  benchmarks = 77 tests: 1 common, 6 diff, 5 parser, 11 fingerprint, 7
-  pricing (+1 benchmark), 18 engine (+1 benchmark, +5 new staleness
-  tests from the COFL session's bug fix), 9 notify, 13 cofl, 4
+- `cargo test --workspace` — passes (98 run + 3 `#[ignore]`'d
+  benchmarks = 101 tests: 1 common, 6 diff, 5 parser, 16 fingerprint
+  (+5 major_modifier_key tests from the tiered-pricing session), 16
+  pricing (+2 benchmarks — rewritten three-tier `PriceCache`, tiered
+  pricing session), 26 engine (+1 benchmark, +8 new tier/confidence
+  tests from the tiered-pricing session on top of the COFL session's
+  +5 staleness tests), 9 notify, 14 cofl (+1 tiered-seeding test), 4
   storage, 1 ingestion wiremock integration, plus doc-tests), on
   rustc 1.94 (the `url`/`idna` pin from the toolchain notes below was
   not needed)
@@ -892,11 +1109,14 @@ architecturally consistent with `flips_found=0` **and**
 `below_threshold=0` simultaneously.
 
 Checked and ruled out as the cause: a bug in `pricing::PriceCache`
-itself. `get()` and `update_batch()` use the identical `shard_index()`
-and `FingerprintHasher`, and the crate's own tests already prove
-insert-then-get works correctly. The mechanism is sound; it's being
-fed data that structurally can't produce hits for uniquely-modified
-items.
+itself. `get()` and `update_batch()` (renamed/split into
+`update_exact_batch()`/`update_major_batch()`/`update_base_batch()` in
+the later tiered-pricing session, same underlying logic) use the
+identical `shard_index()` and `FingerprintHasher`, and the crate's own
+tests already prove insert-then-get works correctly. The mechanism is
+sound; it's being fed data that structurally can't produce hits for
+uniquely-modified items — which the tiered-pricing session's Tier 2/3
+fallbacks now directly address.
 
 **What was added (not a fix at the time — diagnostics only, per
 explicit instruction to diagnose before changing behavior; the
@@ -937,22 +1157,39 @@ assumption held — see the `cofl` crate entry above), and
 `ImplausibleRoi` path) would mean real opportunities are being seen
 but rejected, not that nothing's out there at all.
 
-**Not yet decided — needs the confirmed numbers first:** whether the
-COFL backfill alone resolves the fingerprint-sparsity hypothesis for
-the item tags it covers, or whether a coarser fallback fingerprint
-tier (item id + only the modifiers that matter most, used when the
-exact fingerprint misses) is still needed on top of it for items COFL
-doesn't cover or for the live feed between backfills. Not lowering
-thresholds or removing the plausibility/sample-size guards, which the
-user was explicit about not doing blindly.
+**Decided and implemented (tiered pricing session):** the coarser
+fallback fingerprint tier flagged above as "not yet decided" is now
+built — see the "Pricing is three-tier" architecture bullet and the
+`fingerprint`/`pricing`/`engine`/`cofl`/`ingestion main.rs` entries
+above for the full design. Both COFL and the live feed now seed all
+three tiers (exact fingerprint, major-modifier key, bare item id) from
+the same observations, so items COFL doesn't cover and the live feed
+between backfills both get *some* fallback price instead of only a
+Tier-1-or-nothing outcome. This did not lower `min_profit`,
+`min_roi_percent`, `min_sample_size`, or `max_plausible_roi_percent`
+for Tier 1 at all — the two fallback tiers get a *stricter* effective
+bar (higher confidence floor, ROI multiplier), never a looser one, per
+the explicit "do not loosen everything blindly" instruction. Still not
+yet confirmed against live data (this sandbox has no network access to
+either `api.hypixel.net` or `sky.coflnet.com`): whether Tier 2/3 in
+practice meaningfully raise `flips_found` on top of what the COFL
+backfill and staleness fix already contribute, and whether the
+`major_modifier_roi_multiplier`/`base_item_roi_multiplier` defaults
+(1.5 / 3.0) and confidence thresholds (Medium=10/High=50 samples) are
+well-calibrated for real SkyBlock trade volumes — worth revisiting
+once `diag_tier_exact_hit_total` /
+`diag_tier_major_modifier_hit_total` / `diag_tier_base_item_hit_total`
+(new diagnostic counters, see the `ingestion main.rs` entry above) have
+been read off a live run.
 
 ## Immediate next step
 
 **Run it live** — this is the single highest-value next action, not
-new code. Two independent, code-confirmed fixes (staleness bug) and
-mitigations (COFL backfill) landed this session for `flips_found=0`
-without ever having live Hypixel/COFL access to verify either one end
-to end. A live run would confirm or correct, in priority order:
+new code. Three independent, code-confirmed fixes/mitigations
+(staleness bug fix, COFL backfill, now three-tier pricing) have landed
+across sessions for `flips_found=0` without ever having live
+Hypixel/COFL access to verify any of them end to end. A live run would
+confirm or correct, in priority order:
 1. Whether `flips_found` is now nonzero at all.
 2. Whether `cofl::ImportStats` (logged at startup) shows
    `sales_from_real_nbt > 0` — confirms the `shortItemBytes` decode
@@ -965,7 +1202,16 @@ to end. A live run would confirm or correct, in priority order:
 4. Whether `diag_no_price_data_total` still dominates for the *live*
    feed specifically (now that staleness isn't confounding the
    reading) — confirms or refutes how much the fingerprint-sparsity
-   hypothesis still matters beyond what COFL covers.
+   hypothesis still matters beyond what COFL and the new Tier 2/3
+   fallbacks cover.
+5. (New, tiered-pricing session) The split across
+   `diag_tier_exact_hit_total` / `diag_tier_major_modifier_hit_total` /
+   `diag_tier_base_item_hit_total` — confirms whether Tier 2/3 are
+   actually resolving cache hits in practice, and in what proportion
+   relative to Tier 1. If Tier 2/3 hits are common but rarely turn into
+   `Flip` verdicts, that's a signal to revisit the confidence
+   thresholds/ROI multipliers rather than assume the tiers aren't
+   helping.
 
 Other open items, unblocked by this and listed in priority-neutral
 order:
@@ -973,11 +1219,12 @@ order:
 1. **Ingestion latency.** Flagged since Phase 1.6, still real:
    `detect_latency_ms=238`, `snapshot_fetch_latency_ms=1074` from a
    live run dwarf the entire rest of the pipeline (fingerprinting is
-   µs-scale, price lookup ~55 ns, evaluate ~2.9 ns). This is the
-   "detecting Hypixel's cache refresh as fast as possible" lever
-   called out as the main competitive edge at the top of this file,
-   and it's the one part of the stack that hasn't been touched since
-   the very first session.
+   µs-scale, price lookup ~73 ns for a Tier-1 hit / ~311 ns worst case
+   across all three tiers, evaluate ~3.8 ns). This is the "detecting
+   Hypixel's cache refresh as fast as possible" lever called out as
+   the main competitive edge at the top of this file, and it's the one
+   part of the stack that hasn't been touched since the very first
+   session.
 2. **Phase 2 — Website**, per the Build order section above: live
    flip feed UI, user-configurable min-profit/min-ROI settings (which
    `engine::FlipThresholds` and `pricing`'s placeholder feed are

@@ -5,13 +5,39 @@ use engine::{FeeSchedule, FlipThresholds, FlipVerdict};
 use fingerprint::Fingerprint;
 use ingestion::HypixelClient;
 use notify::{FlipAlert, FlipDeduplicator, NotificationHub};
-use pricing::{PriceCache, PriceEntry, PriceSource};
+use pricing::{PriceCache, PriceEntry, PriceSource, PriceTier};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 use storage::SnapshotStore;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Folds one BIN sighting into a per-tick "cheapest observed BIN" map,
+/// keyed however the caller likes (exact fingerprint, major-modifier
+/// key, or bare item tag) — the same placeholder aggregation
+/// (`min` price, running sample count) applied at all three pricing
+/// tiers. See the loop below for why this is a placeholder, not a real
+/// fair-value estimate.
+fn accumulate_cheapest_bin<K: Eq + Hash>(
+    map: &mut HashMap<K, PriceEntry>,
+    key: K,
+    starting_bid: u64,
+    tick: i64,
+) {
+    map.entry(key)
+        .and_modify(|existing| {
+            existing.sample_size += 1;
+            existing.estimated_value = existing.estimated_value.min(starting_bid);
+        })
+        .or_insert(PriceEntry {
+            estimated_value: starting_bid,
+            sample_size: 1,
+            updated_at_tick: tick,
+            source: PriceSource::Live,
+        });
+}
 
 #[tokio::main]
 async fn main() {
@@ -72,11 +98,11 @@ async fn main() {
     // background, concurrently with ingestion startup below (not
     // awaited, so a slow/rate-limited backfill can never delay the
     // sniper path's first tick). It only ever calls
-    // PriceCache::update_batch, the same non-blocking write path the
-    // live feed uses further down — the hot path (PriceCache::get,
-    // engine::evaluate) has no idea whether an entry came from here or
-    // a live tick. See the cofl crate for the investigation behind this
-    // and its confirmed-vs-assumed caveats.
+    // PriceCache::update_{exact,major,base}_batch, the same non-blocking
+    // write paths the live feed uses further down — the hot path
+    // (PriceCache::get, engine::evaluate) has no idea whether an entry
+    // came from here or a live tick. See the cofl crate for the
+    // investigation behind this and its confirmed-vs-assumed caveats.
     if cofl_backfill_enabled {
         let backfill_cache = Arc::clone(&price_cache);
         tokio::spawn(async move {
@@ -140,6 +166,13 @@ async fn main() {
         // COFL backfill (PriceSource::Historical) rather than a live
         // tick's own observations.
         let mut diag_historical_price_hit_total: u64 = 0;
+        // Tiered-pricing visibility: which tier each cache hit resolved
+        // at. Useful for judging, on a live run, whether Tier 2/3
+        // fallbacks are actually contributing flips or just adding
+        // rejected InsufficientSampleSize verdicts.
+        let mut diag_tier_exact_hit_total: u64 = 0;
+        let mut diag_tier_major_modifier_hit_total: u64 = 0;
+        let mut diag_tier_base_item_hit_total: u64 = 0;
 
         while let Some(snapshot) = rx.recv().await {
             let tick = snapshot.last_updated;
@@ -169,20 +202,28 @@ async fn main() {
             // evaluated do we update the cache for the *next* tick.
             let mut unique_fingerprints: HashSet<Fingerprint> =
                 HashSet::with_capacity(parsed.len());
-            let mut cheapest_bin: HashMap<Fingerprint, PriceEntry> = HashMap::new();
+            let mut cheapest_bin_exact: HashMap<Fingerprint, PriceEntry> = HashMap::new();
+            let mut cheapest_bin_major: HashMap<Fingerprint, PriceEntry> = HashMap::new();
+            let mut cheapest_bin_base: HashMap<String, PriceEntry> = HashMap::new();
             let mut flip_candidates: Vec<FlipAlert> = Vec::new();
             let mut below_threshold = 0usize;
 
             for item in &parsed {
                 let fp = fingerprint::fingerprint(item);
+                let major = fingerprint::major_modifier_key(item);
                 unique_fingerprints.insert(fp);
 
-                let cached_price = price_cache.get(fp);
+                let cached_price = price_cache.get(fp, major, &item.skyblock_item_id);
 
                 diag_evaluated_total += 1;
-                if let Some(price) = cached_price {
+                if let Some(lookup) = cached_price {
                     diag_cache_hit_total += 1;
-                    if price.source == PriceSource::Historical {
+                    match lookup.tier {
+                        PriceTier::Exact => diag_tier_exact_hit_total += 1,
+                        PriceTier::MajorModifiers => diag_tier_major_modifier_hit_total += 1,
+                        PriceTier::BaseItem => diag_tier_base_item_hit_total += 1,
+                    }
+                    if lookup.entry.source == PriceSource::Historical {
                         diag_historical_price_hit_total += 1;
                     }
                 }
@@ -240,32 +281,39 @@ async fn main() {
                 }
 
                 // NOTE: `estimated_value` here is just this tick's
-                // cheapest observed BIN listing per fingerprint — a
-                // placeholder cheap enough to compute inline, not a
-                // real fair-value estimate (median, outlier-trimmed,
-                // etc.). The engine only consumes whatever value the
-                // cache is given; it doesn't validate how it was
-                // derived.
+                // cheapest observed BIN listing per key — a placeholder
+                // cheap enough to compute inline, not a real fair-value
+                // estimate (median, outlier-trimmed, etc.). The engine
+                // only consumes whatever value the cache is given; it
+                // doesn't validate how it was derived. The same live
+                // sighting feeds all three tiers at once: it's an exact
+                // match for its own fingerprint, a major-modifier match
+                // for its item+reforge+stars+hpc+top-enchant
+                // combination, and a base-item match for its bare item
+                // id — mirroring how cofl::backfill seeds all three
+                // tiers from the same COFL sale.
                 if item.bin {
-                    cheapest_bin
-                        .entry(fp)
-                        .and_modify(|existing| {
-                            existing.sample_size += 1;
-                            existing.estimated_value =
-                                existing.estimated_value.min(item.starting_bid);
-                        })
-                        .or_insert(PriceEntry {
-                            estimated_value: item.starting_bid,
-                            sample_size: 1,
-                            updated_at_tick: tick,
-                            source: PriceSource::Live,
-                        });
+                    accumulate_cheapest_bin(&mut cheapest_bin_exact, fp, item.starting_bid, tick);
+                    accumulate_cheapest_bin(
+                        &mut cheapest_bin_major,
+                        major,
+                        item.starting_bid,
+                        tick,
+                    );
+                    accumulate_cheapest_bin(
+                        &mut cheapest_bin_base,
+                        item.skyblock_item_id.clone(),
+                        item.starting_bid,
+                        tick,
+                    );
                 }
             }
 
             let unique_fingerprint_count = unique_fingerprints.len();
-            let priced_fingerprint_count = cheapest_bin.len();
-            price_cache.update_batch(cheapest_bin);
+            let priced_fingerprint_count = cheapest_bin_exact.len();
+            price_cache.update_exact_batch(cheapest_bin_exact);
+            price_cache.update_major_batch(cheapest_bin_major);
+            price_cache.update_base_batch(cheapest_bin_base);
 
             // Dedup (sync, in-memory, batched once per tick) then
             // publish (non-blocking) — see the notify crate's module
@@ -312,6 +360,9 @@ async fn main() {
                 diag_evaluated_total,
                 diag_cache_hit_total,
                 diag_historical_price_hit_total,
+                diag_tier_exact_hit_total,
+                diag_tier_major_modifier_hit_total,
+                diag_tier_base_item_hit_total,
                 diag_not_bin_total,
                 diag_no_price_data_total,
                 diag_insufficient_sample_total,
